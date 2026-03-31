@@ -1,5 +1,5 @@
 """
-DRIFT - The Living Board Game (v2.0)
+DRIFT - No Move Is Safe. No Piece Is Permanent. (v2.0)
 An evolution of tic-tac-toe where the board is alive.
 Place. Push. Decay. Anchor. Draft. Surge.
 """
@@ -367,7 +367,7 @@ class DriftGame:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
-        pygame.display.set_caption("DRIFT - The Living Board Game")
+        pygame.display.set_caption("DRIFT - No Move Is Safe. No Piece Is Permanent.")
         icon_path = self._res("assets/icon.png")
         if os.path.exists(icon_path):
             try:
@@ -675,7 +675,7 @@ class DriftGame:
         t = self.f_md.render("START GAME", True, BUTTON_TEXT)
         self.screen.blit(t, (self.start_btn.centerx - t.get_width() // 2,
                              self.start_btn.centery - t.get_height() // 2))
-        h2 = self.f_sm.render("Place. Push. Decay. Anchor.", True, (80, 110, 140))
+        h2 = self.f_sm.render("No move is safe. No piece is permanent.", True, (80, 110, 140))
         self.screen.blit(h2, (WIN_W // 2 - h2.get_width() // 2, self.start_btn.bottom + 20))
 
     # --- Draft ---
@@ -740,7 +740,7 @@ class DriftGame:
     def _draw_header(self):
         t = self.f_title.render("DRIFT", True, (0, 212, 255))
         self.screen.blit(t, (BOARD_X0, 12))
-        s = self.f_sm.render("The Living Board Game", True, (100, 140, 170))
+        s = self.f_sm.render("No Move Is Safe. No Piece Is Permanent.", True, (100, 140, 170))
         self.screen.blit(s, (BOARD_X0, 44))
         if self.phase != Phase.GAME_OVER:
             pn = "X" if self.current_player == Mark.X else "O"

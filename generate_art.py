@@ -354,7 +354,7 @@ def generate_title_art():
     img = Image.alpha_composite(img, highlight)
 
     # ── subtitle ────────────────────────────────────────────
-    subtitle = "THE LIVING BOARD GAME"
+    subtitle = "NO MOVE IS SAFE. NO PIECE IS PERMANENT."
     sb = tmp_d.textbbox((0, 0), subtitle, font=sub_font)
     sw = sb[2] - sb[0]
     sx = (W - sw) // 2 - sb[0]

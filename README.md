@@ -1,8 +1,8 @@
-# DRIFT — The Living Board Game
+# DRIFT
+
+*No move is safe. No piece is permanent.*
 
 An evolution of Tic-Tac-Toe where the board is alive.
-
-**Place. Push. Decay. Anchor.**
 
 ![Title Art](assets/title_art.png)
 

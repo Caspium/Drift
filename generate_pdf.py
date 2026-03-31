@@ -29,7 +29,7 @@ class DriftPDF(FPDF):
             return  # no header on cover
         self.set_font("Helvetica", "B", 10)
         self.set_text_color(*C_HEADER)
-        self.cell(0, 8, "DRIFT v2.0 - The Living Board Game",
+        self.cell(0, 8, "DRIFT v2.0 - No Move Is Safe. No Piece Is Permanent.",
                   align="R", new_x="LMARGIN", new_y="NEXT")
         self.set_draw_color(*C_ACCENT)
         self.line(10, self.get_y(), 200, self.get_y())
@@ -109,7 +109,7 @@ def build_pdf():
 
     pdf.set_font("Helvetica", "", 18)
     pdf.set_text_color(*C_SUBTITLE)
-    pdf.cell(0, 10, "The Living Board Game  -  v2.0",
+    pdf.cell(0, 10, "No Move Is Safe. No Piece Is Permanent.  -  v2.0",
              align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
 
