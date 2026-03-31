@@ -1,14 +1,13 @@
 """
-DRIFT - The Living Board Game
+DRIFT - The Living Board Game (v2.0)
 An evolution of tic-tac-toe where the board is alive.
-Place. Push. Decay. Anchor.
+Place. Push. Decay. Anchor. Draft. Surge.
 """
 
 import pygame
 import sys
 import math
 import os
-import copy
 from enum import Enum
 
 # ---------------------------------------------------------------------------
@@ -19,46 +18,58 @@ GRID_COLS = 4
 GRID_ROWS = 4
 BOARD_W = CELL_SIZE * GRID_COLS
 BOARD_H = CELL_SIZE * GRID_ROWS
-SIDEBAR_W = 280
+SIDEBAR_W = 290
 ARROW_MARGIN = 50
 TOP_MARGIN = 80
-BOTTOM_MARGIN = 40
+BOTTOM_MARGIN = 50
 WIN_W = ARROW_MARGIN + BOARD_W + ARROW_MARGIN + SIDEBAR_W
 WIN_H = TOP_MARGIN + BOARD_H + ARROW_MARGIN + BOTTOM_MARGIN
 BOARD_X0 = ARROW_MARGIN
 BOARD_Y0 = TOP_MARGIN
 MAX_AGE = 6
+SENTINEL_DECAY = 4
+PHANTOM_DURATION = 2
+LEECH_DRAIN = 2
 ANCHORS_PER_PLAYER = 2
-WIN_LENGTH = 4
 FPS = 60
-ANIM_DURATION = 0.25  # seconds for push animation
+ANIM_DURATION = 0.25
 
 # Colors
 BG_COLOR = (10, 22, 40)
 GRID_COLOR = (0, 180, 220)
-GRID_GLOW = (0, 100, 140, 60)
 X_COLOR = (255, 71, 87)
 O_COLOR = (46, 213, 115)
-X_DIM = (120, 40, 50)
-O_DIM = (25, 100, 60)
 TEXT_COLOR = (220, 230, 240)
 SIDEBAR_BG = (16, 30, 52)
-HIGHLIGHT_COLOR = (255, 255, 255, 40)
 ANCHOR_COLOR = (255, 215, 0)
 ARROW_COLOR = (60, 90, 120)
 ARROW_HOVER = (0, 212, 255)
 BUTTON_COLOR = (30, 60, 100)
 BUTTON_HOVER = (50, 100, 160)
 BUTTON_TEXT = (220, 240, 255)
-WIN_LINE_COLOR = (255, 255, 255)
-PHASE_COLORS = {
-    "place": (0, 212, 255),
-    "action": (255, 165, 0),
+SURGE_COLOR = (255, 200, 50)
+
+ZONE_COLORS = {
+    "rift": (0, 80, 160, 50),
+    "accel": (160, 60, 0, 50),
+    "warp": (100, 0, 160, 50),
+}
+ZONE_TEXT_COLORS = {
+    "rift": (60, 140, 220),
+    "accel": (220, 120, 40),
+    "warp": (160, 80, 220),
+}
+
+POWER_COLORS = {
+    "phantom": (150, 200, 255),
+    "catalyst": (255, 180, 50),
+    "leech": (180, 50, 220),
+    "sentinel": (200, 200, 200),
 }
 
 
 # ---------------------------------------------------------------------------
-# Enums / Data
+# Enums
 # ---------------------------------------------------------------------------
 class Mark(Enum):
     EMPTY = 0
@@ -68,8 +79,10 @@ class Mark(Enum):
 
 class Phase(Enum):
     TITLE = "title"
+    DRAFT = "draft"
     PLACE = "place"
-    ACTION = "action"  # push or anchor (or skip)
+    ACTION = "action"
+    SURGE = "surge"
     GAME_OVER = "game_over"
 
 
@@ -80,270 +93,434 @@ class Direction(Enum):
     RIGHT = "right"
 
 
+class PieceType(Enum):
+    NORMAL = "normal"
+    PHANTOM = "phantom"
+    CATALYST = "catalyst"
+    LEECH = "leech"
+    SENTINEL = "sentinel"
+
+
+class Zone(Enum):
+    NONE = "none"
+    RIFT = "rift"
+    ACCELERATOR = "accel"
+    WARP = "warp"
+
+
+ZONE_LAYOUT = {
+    (1, 1): Zone.RIFT,
+    (2, 2): Zone.ACCELERATOR,
+    (0, 3): Zone.WARP,
+    (3, 0): Zone.WARP,
+}
+
+POWER_PIECE_INFO = [
+    (PieceType.PHANTOM, "Phantom", "Immune to pushes", "for 2 turns"),
+    (PieceType.CATALYST, "Catalyst", "When pushed, explodes", "pushing adjacent pieces"),
+    (PieceType.LEECH, "Leech", "On place, ages adjacent", "enemy pieces by 2"),
+    (PieceType.SENTINEL, "Sentinel", "Auto-anchored on place", "Decays in 4 turns"),
+]
+
+
 # ---------------------------------------------------------------------------
 # Cell
 # ---------------------------------------------------------------------------
 class Cell:
-    __slots__ = ("mark", "age", "anchored", "anchor_turns_left")
+    __slots__ = ("mark", "age", "anchored", "piece_type", "phantom_turns")
 
     def __init__(self):
         self.mark = Mark.EMPTY
         self.age = 0
         self.anchored = False
-        self.anchor_turns_left = 0
+        self.piece_type = PieceType.NORMAL
+        self.phantom_turns = 0
 
     def copy(self):
         c = Cell()
         c.mark = self.mark
         c.age = self.age
         c.anchored = self.anchored
-        c.anchor_turns_left = self.anchor_turns_left
+        c.piece_type = self.piece_type
+        c.phantom_turns = self.phantom_turns
         return c
+
+    def is_immovable(self):
+        if self.anchored:
+            return True
+        if self.piece_type == PieceType.PHANTOM and self.phantom_turns > 0:
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
-# Board Logic
+# Board
 # ---------------------------------------------------------------------------
 class Board:
     def __init__(self):
         self.grid = [[Cell() for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)]
-        self.turn_count = 0
+        self.zones = dict(ZONE_LAYOUT)
 
-    def place(self, r, c, mark):
-        if self.grid[r][c].mark != Mark.EMPTY:
+    def place(self, r, c, mark, piece_type=PieceType.NORMAL):
+        cell = self.grid[r][c]
+        if cell.mark != Mark.EMPTY:
             return False
-        self.grid[r][c].mark = mark
-        self.grid[r][c].age = 0
-        self.grid[r][c].anchored = False
-        self.grid[r][c].anchor_turns_left = 0
+        cell.mark = mark
+        cell.age = 0
+        cell.anchored = False
+        cell.piece_type = piece_type
+        cell.phantom_turns = PHANTOM_DURATION if piece_type == PieceType.PHANTOM else 0
+        # Sentinel auto-anchor (unless on Rift)
+        if piece_type == PieceType.SENTINEL:
+            zone = self.zones.get((r, c), Zone.NONE)
+            if zone != Zone.RIFT:
+                cell.anchored = True
         return True
 
+    def apply_leech(self, r, c):
+        """Drain adjacent enemy pieces when a Leech is placed."""
+        owner = self.grid[r][c].mark
+        decayed = []
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < GRID_ROWS and 0 <= nc < GRID_COLS:
+                adj = self.grid[nr][nc]
+                if adj.mark != Mark.EMPTY and adj.mark != owner:
+                    adj.age += LEECH_DRAIN
+                    max_a = SENTINEL_DECAY if adj.piece_type == PieceType.SENTINEL else MAX_AGE
+                    if adj.age > max_a:
+                        decayed.append((nr, nc))
+                        self.grid[nr][nc] = Cell()
+        return decayed
+
     def push(self, axis, index, direction):
-        """Push a row or column. axis='row' or 'col'. direction=+1 or -1.
-        Returns list of (old_r, old_c, new_r, new_c) for animation.
-        Anchored pieces stay in place; non-anchored pieces slide among
-        the free slots, wrapping around."""
+        """Push a row or column. Returns move list for animation."""
         moves = []
         if axis == "row":
             row = [self.grid[index][c].copy() for c in range(GRID_COLS)]
-            anchored_positions = {c for c in range(GRID_COLS) if row[c].anchored}
-            final_row = [None] * GRID_COLS
-            for c in anchored_positions:
-                final_row[c] = row[c]
+            immovable = {c for c in range(GRID_COLS) if row[c].is_immovable()}
+            final = [None] * GRID_COLS
+            for c in immovable:
+                final[c] = row[c]
                 moves.append((index, c, index, c))
-            non_anch_cells = [row[c] for c in range(GRID_COLS) if c not in anchored_positions]
-            free_slots = [c for c in range(GRID_COLS) if c not in anchored_positions]
+            free_cells = [row[c] for c in range(GRID_COLS) if c not in immovable]
+            free_slots = [c for c in range(GRID_COLS) if c not in immovable]
             if free_slots:
-                shifted_slots = [free_slots[(i + direction) % len(free_slots)] for i in range(len(free_slots))]
-                for i, cell in enumerate(non_anch_cells):
-                    final_row[shifted_slots[i]] = cell
-                    moves.append((index, free_slots[i], index, shifted_slots[i]))
+                shifted = [free_slots[(i + direction) % len(free_slots)] for i in range(len(free_slots))]
+                for i, cell in enumerate(free_cells):
+                    final[shifted[i]] = cell
+                    moves.append((index, free_slots[i], index, shifted[i]))
             for c in range(GRID_COLS):
-                self.grid[index][c] = final_row[c] if final_row[c] else Cell()
+                self.grid[index][c] = final[c] if final[c] else Cell()
 
         elif axis == "col":
             col = [self.grid[r][index].copy() for r in range(GRID_ROWS)]
-            anchored_positions = {r for r in range(GRID_ROWS) if col[r].anchored}
-            final_col = [None] * GRID_ROWS
-            moves = []
-            for r in anchored_positions:
-                final_col[r] = col[r]
+            immovable = {r for r in range(GRID_ROWS) if col[r].is_immovable()}
+            final = [None] * GRID_ROWS
+            for r in immovable:
+                final[r] = col[r]
                 moves.append((r, index, r, index))
-            non_anch_cells = [col[r] for r in range(GRID_ROWS) if r not in anchored_positions]
-            free_slots = [r for r in range(GRID_ROWS) if r not in anchored_positions]
-            if len(free_slots) > 0:
-                shifted_slots = [free_slots[(i + direction) % len(free_slots)] for i in range(len(free_slots))]
-                for i, cell in enumerate(non_anch_cells):
-                    final_col[shifted_slots[i]] = cell
-                    moves.append((free_slots[i], index, shifted_slots[i], index))
+            free_cells = [col[r] for r in range(GRID_ROWS) if r not in immovable]
+            free_slots = [r for r in range(GRID_ROWS) if r not in immovable]
+            if free_slots:
+                shifted = [free_slots[(i + direction) % len(free_slots)] for i in range(len(free_slots))]
+                for i, cell in enumerate(free_cells):
+                    final[shifted[i]] = cell
+                    moves.append((free_slots[i], index, shifted[i], index))
             for r in range(GRID_ROWS):
-                self.grid[r][index] = final_col[r] if final_col[r] else Cell()
+                self.grid[r][index] = final[r] if final[r] else Cell()
 
         return moves
 
+    def apply_catalyst_effects(self, move_list):
+        """After push, detonate any Catalyst that moved. Returns extra moves."""
+        extra = []
+        for (or_, oc, nr, nc) in move_list:
+            if or_ == nr and oc == nc:
+                continue
+            cell = self.grid[nr][nc]
+            if cell.piece_type != PieceType.CATALYST:
+                continue
+            cell.piece_type = PieceType.NORMAL  # spent
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                ar, ac = nr + dr, nc + dc
+                if 0 <= ar < GRID_ROWS and 0 <= ac < GRID_COLS:
+                    adj = self.grid[ar][ac]
+                    if adj.mark != Mark.EMPTY and not adj.is_immovable():
+                        dest_r = (ar + dr) % GRID_ROWS
+                        dest_c = (ac + dc) % GRID_COLS
+                        if self.grid[dest_r][dest_c].mark == Mark.EMPTY:
+                            self.grid[dest_r][dest_c] = adj.copy()
+                            self.grid[ar][ac] = Cell()
+                            extra.append((ar, ac, dest_r, dest_c))
+        return extra
+
+    def apply_warp_effects(self, move_list):
+        """After push, teleport pieces that landed on warp cells."""
+        warp_cells = [pos for pos, z in self.zones.items() if z == Zone.WARP]
+        if len(warp_cells) != 2:
+            return []
+        wa, wb = warp_cells
+        teleports = []
+        for (or_, oc, nr, nc) in move_list:
+            if or_ == nr and oc == nc:
+                continue
+            if (nr, nc) == wa:
+                dest = wb
+            elif (nr, nc) == wb:
+                dest = wa
+            else:
+                continue
+            if self.grid[dest[0]][dest[1]].mark == Mark.EMPTY:
+                self.grid[dest[0]][dest[1]] = self.grid[nr][nc].copy()
+                self.grid[nr][nc] = Cell()
+                teleports.append((nr, nc, dest[0], dest[1]))
+        return teleports
+
     def age_pieces(self):
-        """Age all pieces by 1. Remove those that exceed MAX_AGE."""
+        """Age all pieces. Remove decayed. Returns list of removed (r,c,mark)."""
         removed = []
         for r in range(GRID_ROWS):
             for c in range(GRID_COLS):
                 cell = self.grid[r][c]
-                if cell.mark != Mark.EMPTY:
-                    cell.age += 1
-                    if cell.anchored:
-                        cell.anchor_turns_left -= 1
-                        if cell.anchor_turns_left <= 0:
-                            cell.anchored = False
-                    if cell.age > MAX_AGE:
-                        removed.append((r, c, cell.mark))
-                        cell.mark = Mark.EMPTY
-                        cell.age = 0
-                        cell.anchored = False
+                if cell.mark == Mark.EMPTY:
+                    continue
+                zone = self.zones.get((r, c), Zone.NONE)
+                # Phantom countdown (always 1/turn regardless of zone)
+                if cell.piece_type == PieceType.PHANTOM and cell.phantom_turns > 0:
+                    cell.phantom_turns -= 1
+                    if cell.phantom_turns <= 0:
+                        cell.piece_type = PieceType.NORMAL
+                # Aging (affected by zones)
+                if zone == Zone.RIFT:
+                    continue  # no aging on rift
+                increment = 2 if zone == Zone.ACCELERATOR else 1
+                cell.age += increment
+                max_a = SENTINEL_DECAY if cell.piece_type == PieceType.SENTINEL else MAX_AGE
+                if cell.age > max_a:
+                    removed.append((r, c, cell.mark))
+                    self.grid[r][c] = Cell()
         return removed
 
     def check_winner(self):
         """Check for 4-in-a-row. Returns (Mark, [(r,c)...]) or (None, None)."""
         lines = []
-        # Rows
         for r in range(GRID_ROWS):
             lines.append([(r, c) for c in range(GRID_COLS)])
-        # Cols
         for c in range(GRID_COLS):
             lines.append([(r, c) for r in range(GRID_ROWS)])
-        # Diagonals
         lines.append([(i, i) for i in range(4)])
         lines.append([(i, 3 - i) for i in range(4)])
-
         for line in lines:
             marks = [self.grid[r][c].mark for r, c in line]
             if marks[0] != Mark.EMPTY and all(m == marks[0] for m in marks):
                 return marks[0], line
         return None, None
 
-    def is_full(self):
+    def has_three_in_a_row(self, mark):
+        """Check if mark has any 3 consecutive in a line."""
+        # All lines of 3
+        lines = []
         for r in range(GRID_ROWS):
-            for c in range(GRID_COLS):
-                if self.grid[r][c].mark == Mark.EMPTY:
-                    return False
-        return True
+            for sc in range(GRID_COLS - 2):
+                lines.append([(r, sc + i) for i in range(3)])
+        for c in range(GRID_COLS):
+            for sr in range(GRID_ROWS - 2):
+                lines.append([(sr + i, c) for i in range(3)])
+        for r in range(GRID_ROWS - 2):
+            for c in range(GRID_COLS - 2):
+                lines.append([(r + i, c + i) for i in range(3)])
+        for r in range(GRID_ROWS - 2):
+            for c in range(2, GRID_COLS):
+                lines.append([(r + i, c - i) for i in range(3)])
+        for line in lines:
+            if all(self.grid[r][c].mark == mark for r, c in line):
+                return True
+        return False
 
 
 # ---------------------------------------------------------------------------
-# Arrow Hit Zones (for push controls)
+# Arrow
 # ---------------------------------------------------------------------------
 class Arrow:
     def __init__(self, cx, cy, direction, axis, index, points):
-        self.cx = cx
-        self.cy = cy
+        self.cx, self.cy = cx, cy
         self.direction = direction
         self.axis = axis
         self.index = index
-        self.points = points  # polygon points for drawing
-        self.rect = pygame.Rect(0, 0, 0, 0)
-        if points:
-            xs = [p[0] for p in points]
-            ys = [p[1] for p in points]
-            pad = 6
-            self.rect = pygame.Rect(min(xs) - pad, min(ys) - pad,
-                                    max(xs) - min(xs) + 2 * pad,
-                                    max(ys) - min(ys) + 2 * pad)
+        self.points = points
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        pad = 6
+        self.rect = pygame.Rect(min(xs) - pad, min(ys) - pad,
+                                max(xs) - min(xs) + 2 * pad,
+                                max(ys) - min(ys) + 2 * pad)
 
     def contains(self, pos):
         return self.rect.collidepoint(pos)
 
 
 # ---------------------------------------------------------------------------
-# Game Class
+# Game
 # ---------------------------------------------------------------------------
 class DriftGame:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
         pygame.display.set_caption("DRIFT - The Living Board Game")
-        # Try to load icon
-        icon_path = self._resource_path("assets/icon.png")
+        icon_path = self._res("assets/icon.png")
         if os.path.exists(icon_path):
             try:
-                icon = pygame.image.load(icon_path)
-                pygame.display.set_icon(icon)
+                pygame.display.set_icon(pygame.image.load(icon_path))
             except Exception:
                 pass
-
         self.clock = pygame.time.Clock()
-        self.font_sm = pygame.font.SysFont("consolas", 16)
-        self.font_md = pygame.font.SysFont("consolas", 22, bold=True)
-        self.font_lg = pygame.font.SysFont("consolas", 36, bold=True)
-        self.font_xl = pygame.font.SysFont("consolas", 52, bold=True)
-        self.font_title = pygame.font.SysFont("consolas", 28, bold=True)
+        self.f_sm = pygame.font.SysFont("consolas", 15)
+        self.f_md = pygame.font.SysFont("consolas", 20, bold=True)
+        self.f_lg = pygame.font.SysFont("consolas", 34, bold=True)
+        self.f_xl = pygame.font.SysFont("consolas", 48, bold=True)
+        self.f_title = pygame.font.SysFont("consolas", 26, bold=True)
+        self.f_zone = pygame.font.SysFont("consolas", 13, bold=True)
 
-        # Load title art
+        # Title art
         self.title_art = None
-        title_path = self._resource_path("assets/title_art.png")
-        if os.path.exists(title_path):
+        tp = self._res("assets/title_art.png")
+        if os.path.exists(tp):
             try:
-                self.title_art = pygame.image.load(title_path).convert_alpha()
-                # Scale to fit nicely
-                art_w = min(WIN_W - 60, self.title_art.get_width())
-                scale = art_w / self.title_art.get_width()
-                art_h = int(self.title_art.get_height() * scale)
-                self.title_art = pygame.transform.smoothscale(self.title_art, (art_w, art_h))
+                img = pygame.image.load(tp).convert_alpha()
+                scale = min(WIN_W - 60, img.get_width()) / img.get_width()
+                self.title_art = pygame.transform.smoothscale(
+                    img, (int(img.get_width() * scale), int(img.get_height() * scale)))
             except Exception:
                 pass
 
-        self.reset_game()
-        self.phase = Phase.TITLE  # start on title screen
         self.arrows = self._build_arrows()
         self.hovered_arrow = None
         self.hovered_cell = None
-        self.anchor_mode = False
-        self.hovered_anchor_cell = None
 
-        # Animation state
+        # Animation
         self.animating = False
-        self.anim_moves = []  # list of (old_r, old_c, new_r, new_c, mark, age, anchored)
+        self.anim_moves = []
         self.anim_start = 0
-        self.anim_removed = []  # cells to flash-remove after animation
-        self.pending_winner_check = False
+        self.pending_post_push = False
 
-        # Win animation
-        self.win_line = None
-        self.win_time = 0
-
-        # Buttons
-        btn_y = WIN_H - BOTTOM_MARGIN - 40
-        self.skip_btn = pygame.Rect(WIN_W - SIDEBAR_W + 20, btn_y, 110, 36)
-        self.anchor_btn = pygame.Rect(WIN_W - SIDEBAR_W + 145, btn_y, 115, 36)
+        # Buttons (positioned later in draw methods)
+        btn_y = WIN_H - BOTTOM_MARGIN - 6
+        sb_x = WIN_W - SIDEBAR_W + 15
+        self.skip_btn = pygame.Rect(sb_x, btn_y, 100, 34)
+        self.anchor_btn = pygame.Rect(sb_x + 115, btn_y, 100, 34)
         self.restart_btn = pygame.Rect(WIN_W // 2 - 80, WIN_H // 2 + 60, 160, 44)
         self.start_btn = pygame.Rect(WIN_W // 2 - 100, WIN_H // 2 + 80, 200, 50)
-        self.show_instructions = False
-        self.instructions_btn = pygame.Rect(WIN_W - SIDEBAR_W + 20, TOP_MARGIN + 280, 240, 36)
+        self.confirm_btn = pygame.Rect(WIN_W // 2 - 80, 0, 160, 44)  # y set in draw
 
-    def _resource_path(self, relative):
-        """Get path to resource, works for dev and PyInstaller."""
+        # Draft card rects (built in draw)
+        self.card_rects = []
+        self._build_card_rects()
+
+        # Power piece buttons in sidebar (built once)
+        self.pp_btns = []  # list of (rect, PieceType)
+
+        self.reset_to_title()
+
+    def _res(self, rel):
         if hasattr(sys, '_MEIPASS'):
-            return os.path.join(sys._MEIPASS, relative)
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative)
+            return os.path.join(sys._MEIPASS, rel)
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
 
-    def reset_game(self):
+    def _build_arrows(self):
+        arrows = []
+        sz = 14
+        for c in range(GRID_COLS):
+            cx = BOARD_X0 + c * CELL_SIZE + CELL_SIZE // 2
+            cy = BOARD_Y0 - 22
+            arrows.append(Arrow(cx, cy, Direction.DOWN, "col", c,
+                                [(cx, cy + sz), (cx - sz, cy - sz // 2), (cx + sz, cy - sz // 2)]))
+        for c in range(GRID_COLS):
+            cx = BOARD_X0 + c * CELL_SIZE + CELL_SIZE // 2
+            cy = BOARD_Y0 + BOARD_H + 22
+            arrows.append(Arrow(cx, cy, Direction.UP, "col", c,
+                                [(cx, cy - sz), (cx - sz, cy + sz // 2), (cx + sz, cy + sz // 2)]))
+        for r in range(GRID_ROWS):
+            cx = BOARD_X0 - 22
+            cy = BOARD_Y0 + r * CELL_SIZE + CELL_SIZE // 2
+            arrows.append(Arrow(cx, cy, Direction.RIGHT, "row", r,
+                                [(cx + sz, cy), (cx - sz // 2, cy - sz), (cx - sz // 2, cy + sz)]))
+        for r in range(GRID_ROWS):
+            cx = BOARD_X0 + BOARD_W + 22
+            cy = BOARD_Y0 + r * CELL_SIZE + CELL_SIZE // 2
+            arrows.append(Arrow(cx, cy, Direction.LEFT, "row", r,
+                                [(cx - sz, cy), (cx + sz // 2, cy - sz), (cx + sz // 2, cy + sz)]))
+        return arrows
+
+    def _build_card_rects(self):
+        cw, ch, gap = 180, 130, 20
+        gw = cw * 2 + gap
+        sx = (WIN_W - gw) // 2
+        sy = 160
+        self.card_rects = []
+        for row in range(2):
+            for col in range(2):
+                self.card_rects.append(pygame.Rect(
+                    sx + col * (cw + gap), sy + row * (ch + gap), cw, ch))
+        self.confirm_btn = pygame.Rect(WIN_W // 2 - 80, sy + 2 * (ch + gap) + 20, 160, 44)
+
+    # ------------------------------------------------------------------
+    # State management
+    # ------------------------------------------------------------------
+    def reset_to_title(self):
+        self.phase = Phase.TITLE
         self.board = Board()
         self.current_player = Mark.X
-        self.phase = Phase.PLACE
-        self.anchors_remaining = {Mark.X: ANCHORS_PER_PLAYER, Mark.O: ANCHORS_PER_PLAYER}
+        self.anchors = {Mark.X: ANCHORS_PER_PLAYER, Mark.O: ANCHORS_PER_PLAYER}
+        self.power_pieces = {Mark.X: {}, Mark.O: {}}
+        self.winner = None
+        self.win_line = None
+        self.win_time = 0
+        self.turn_number = 1
+        self.animating = False
+        self.anchor_mode = False
+        self.selected_pp = None  # selected power piece type for placement
+        self.message = ""
+        self.msg_time = 0
+        # Draft state
+        self.draft_player = Mark.X
+        self.draft_counts = {}  # PieceType -> int
+        self._reset_draft_counts()
+
+    def _reset_draft_counts(self):
+        self.draft_counts = {pt: 0 for pt, _, _, _ in POWER_PIECE_INFO}
+
+    def start_draft(self):
+        self.phase = Phase.DRAFT
+        self.draft_player = Mark.X
+        self._reset_draft_counts()
+
+    def confirm_draft(self):
+        picks = {pt: n for pt, n in self.draft_counts.items() if n > 0}
+        self.power_pieces[self.draft_player] = picks
+        if self.draft_player == Mark.X:
+            self.draft_player = Mark.O
+            self._reset_draft_counts()
+        else:
+            # Both drafted — start game
+            self.phase = Phase.PLACE
+            self.current_player = Mark.X
+            self.turn_number = 1
+
+    def reset_game(self):
+        """Full reset back to draft."""
+        self.board = Board()
+        self.current_player = Mark.X
+        self.anchors = {Mark.X: ANCHORS_PER_PLAYER, Mark.O: ANCHORS_PER_PLAYER}
+        self.power_pieces = {Mark.X: {}, Mark.O: {}}
         self.winner = None
         self.win_line = None
         self.turn_number = 1
         self.animating = False
         self.anchor_mode = False
+        self.selected_pp = None
         self.message = ""
-        self.message_timer = 0
-
-    def _build_arrows(self):
-        arrows = []
-        sz = 14
-        # Top arrows (push column down)
-        for c in range(GRID_COLS):
-            cx = BOARD_X0 + c * CELL_SIZE + CELL_SIZE // 2
-            cy = BOARD_Y0 - 22
-            pts = [(cx, cy + sz), (cx - sz, cy - sz // 2), (cx + sz, cy - sz // 2)]
-            arrows.append(Arrow(cx, cy, Direction.DOWN, "col", c, pts))
-        # Bottom arrows (push column up)
-        for c in range(GRID_COLS):
-            cx = BOARD_X0 + c * CELL_SIZE + CELL_SIZE // 2
-            cy = BOARD_Y0 + BOARD_H + 22
-            pts = [(cx, cy - sz), (cx - sz, cy + sz // 2), (cx + sz, cy + sz // 2)]
-            arrows.append(Arrow(cx, cy, Direction.UP, "col", c, pts))
-        # Left arrows (push row right)
-        for r in range(GRID_ROWS):
-            cx = BOARD_X0 - 22
-            cy = BOARD_Y0 + r * CELL_SIZE + CELL_SIZE // 2
-            pts = [(cx + sz, cy), (cx - sz // 2, cy - sz), (cx - sz // 2, cy + sz)]
-            arrows.append(Arrow(cx, cy, Direction.RIGHT, "row", r, pts))
-        # Right arrows (push row left)
-        for r in range(GRID_ROWS):
-            cx = BOARD_X0 + BOARD_W + 22
-            cy = BOARD_Y0 + r * CELL_SIZE + CELL_SIZE // 2
-            pts = [(cx - sz, cy), (cx + sz // 2, cy - sz), (cx + sz // 2, cy + sz)]
-            arrows.append(Arrow(cx, cy, Direction.LEFT, "row", r, pts))
-        return arrows
+        self.start_draft()
 
     # ------------------------------------------------------------------
     # Game logic
@@ -351,79 +528,115 @@ class DriftGame:
     def do_place(self, r, c):
         if self.phase != Phase.PLACE or self.animating:
             return
-        if self.board.place(r, c, self.current_player):
-            # Check for winner immediately after placement
-            winner, line = self.board.check_winner()
-            if winner:
-                self.winner = winner
-                self.win_line = line
-                self.win_time = pygame.time.get_ticks()
-                self.phase = Phase.GAME_OVER
+        pt = self.selected_pp or PieceType.NORMAL
+        if pt != PieceType.NORMAL:
+            avail = self.power_pieces[self.current_player].get(pt, 0)
+            if avail <= 0:
+                self.set_msg("No pieces of that type left!")
                 return
-            self.phase = Phase.ACTION
-            self.anchor_mode = False
+        if not self.board.place(r, c, self.current_player, pt):
+            return
+        # Consume power piece
+        if pt != PieceType.NORMAL:
+            self.power_pieces[self.current_player][pt] -= 1
+            self.selected_pp = None
+        # Leech effect
+        if pt == PieceType.LEECH:
+            self.board.apply_leech(r, c)
+        # Win check
+        w, line = self.board.check_winner()
+        if w:
+            self._set_winner(w, line)
+            return
+        self.phase = Phase.ACTION
+        self.anchor_mode = False
 
     def do_push(self, arrow):
-        if self.phase != Phase.ACTION or self.animating:
+        if self.phase not in (Phase.ACTION, Phase.SURGE) or self.animating:
             return
         axis = arrow.axis
         index = arrow.index
         d = 1 if arrow.direction in (Direction.DOWN, Direction.RIGHT) else -1
-        # Save pre-push state for animation
-        pre_grid = [[self.board.grid[r][c].copy() for c in range(GRID_COLS)] for r in range(GRID_ROWS)]
+        pre = [[self.board.grid[r][c].copy() for c in range(GRID_COLS)] for r in range(GRID_ROWS)]
         move_list = self.board.push(axis, index, d)
-        # Build animation data
         self.anim_moves = []
         for (or_, oc, nr, nc) in move_list:
-            cell = pre_grid[or_][oc]
+            cell = pre[or_][oc]
             if cell.mark != Mark.EMPTY:
-                self.anim_moves.append((or_, oc, nr, nc, cell.mark, cell.age, cell.anchored))
+                self.anim_moves.append((or_, oc, nr, nc, cell.mark, cell.age,
+                                        cell.anchored, cell.piece_type, cell.phantom_turns))
+        self._push_move_list = move_list
         self.animating = True
         self.anim_start = pygame.time.get_ticks()
-        self.pending_winner_check = True
+        self.pending_post_push = True
+
+    def _on_push_complete(self):
+        """Called when push animation finishes."""
+        move_list = self._push_move_list
+        # Catalyst chain
+        cat_moves = self.board.apply_catalyst_effects(move_list)
+        # Warp teleports (from original push + catalyst moves)
+        all_moves = move_list + cat_moves
+        self.board.apply_warp_effects(all_moves)
+        # Win check
+        w, line = self.board.check_winner()
+        if w:
+            self._set_winner(w, line)
+            return
+        # Surge check (only from ACTION, not from SURGE)
+        if self.phase == Phase.ACTION:
+            if self.board.has_three_in_a_row(self.current_player):
+                self.phase = Phase.SURGE
+                self.set_msg("SURGE! Bonus action!")
+                return
+        self.end_turn()
 
     def do_anchor(self, r, c):
-        if self.phase != Phase.ACTION or self.animating:
+        if self.phase not in (Phase.ACTION, Phase.SURGE) or self.animating:
             return
         cell = self.board.grid[r][c]
         if cell.mark != self.current_player:
             return
         if cell.anchored:
-            self.set_message("Already anchored!")
+            self.set_msg("Already anchored!")
             return
-        if self.anchors_remaining[self.current_player] <= 0:
-            self.set_message("No anchors left!")
+        zone = self.board.zones.get((r, c), Zone.NONE)
+        if zone == Zone.RIFT:
+            self.set_msg("Can't anchor on Rift!")
+            return
+        if self.anchors[self.current_player] <= 0:
+            self.set_msg("No anchors left!")
             return
         cell.anchored = True
-        cell.anchor_turns_left = 99  # permanent until piece decays
-        self.anchors_remaining[self.current_player] -= 1
+        self.anchors[self.current_player] -= 1
         self.end_turn()
 
     def do_skip(self):
-        if self.phase != Phase.ACTION or self.animating:
+        if self.phase not in (Phase.ACTION, Phase.SURGE) or self.animating:
             return
         self.end_turn()
 
     def end_turn(self):
-        # Age pieces
         removed = self.board.age_pieces()
-        # Check winner after push/aging
-        winner, line = self.board.check_winner()
-        if winner:
-            self.winner = winner
-            self.win_line = line
-            self.win_time = pygame.time.get_ticks()
-            self.phase = Phase.GAME_OVER
+        w, line = self.board.check_winner()
+        if w:
+            self._set_winner(w, line)
             return
-        # Switch player
         self.current_player = Mark.O if self.current_player == Mark.X else Mark.X
         self.phase = Phase.PLACE
         self.anchor_mode = False
+        self.selected_pp = None
         self.turn_number += 1
 
-    def set_message(self, msg):
+    def _set_winner(self, mark, line):
+        self.winner = mark
+        self.win_line = line
+        self.win_time = pygame.time.get_ticks()
+        self.phase = Phase.GAME_OVER
+
+    def set_msg(self, msg):
         self.message = msg
-        self.message_timer = pygame.time.get_ticks()
+        self.msg_time = pygame.time.get_ticks()
 
     # ------------------------------------------------------------------
     # Drawing
@@ -431,145 +644,256 @@ class DriftGame:
     def draw(self):
         self.screen.fill(BG_COLOR)
         if self.phase == Phase.TITLE:
-            self._draw_title_screen()
-            pygame.display.flip()
-            return
-        self._draw_header()
-        self._draw_sidebar()
-        if self.animating:
-            self._draw_board_animating()
+            self._draw_title()
+        elif self.phase == Phase.DRAFT:
+            self._draw_draft()
         else:
+            self._draw_header()
+            self._draw_sidebar()
             self._draw_board()
-        self._draw_arrows()
-        if self.phase == Phase.ACTION and not self.animating:
-            self._draw_action_buttons()
-        if self.phase == Phase.GAME_OVER:
-            self._draw_game_over()
-        if self.message and pygame.time.get_ticks() - self.message_timer < 2000:
-            self._draw_message()
+            self._draw_arrows()
+            if self.phase in (Phase.ACTION, Phase.SURGE) and not self.animating:
+                self._draw_action_buttons()
+            if self.phase == Phase.GAME_OVER:
+                self._draw_game_over()
+            if self.message and pygame.time.get_ticks() - self.msg_time < 2500:
+                self._draw_message()
         pygame.display.flip()
 
-    def _draw_title_screen(self):
+    # --- Title ---
+    def _draw_title(self):
         if self.title_art:
             ax = (WIN_W - self.title_art.get_width()) // 2
-            ay = WIN_H // 2 - self.title_art.get_height() // 2 - 40
-            self.screen.blit(self.title_art, (ax, ay))
+            self.screen.blit(self.title_art, (ax, WIN_H // 2 - self.title_art.get_height() // 2 - 40))
         else:
-            txt = self.font_xl.render("DRIFT", True, (0, 212, 255))
-            self.screen.blit(txt, (WIN_W // 2 - txt.get_width() // 2, WIN_H // 3))
-            sub = self.font_md.render("The Living Board Game", True, (100, 140, 170))
-            self.screen.blit(sub, (WIN_W // 2 - sub.get_width() // 2, WIN_H // 3 + 60))
+            t = self.f_xl.render("DRIFT", True, (0, 212, 255))
+            self.screen.blit(t, (WIN_W // 2 - t.get_width() // 2, WIN_H // 3))
+        mouse = pygame.mouse.get_pos()
+        h = self.start_btn.collidepoint(mouse)
+        pygame.draw.rect(self.screen, BUTTON_HOVER if h else BUTTON_COLOR, self.start_btn, border_radius=10)
+        pygame.draw.rect(self.screen, (0, 212, 255), self.start_btn, 2, border_radius=10)
+        t = self.f_md.render("START GAME", True, BUTTON_TEXT)
+        self.screen.blit(t, (self.start_btn.centerx - t.get_width() // 2,
+                             self.start_btn.centery - t.get_height() // 2))
+        h2 = self.f_sm.render("Place. Push. Decay. Anchor.", True, (80, 110, 140))
+        self.screen.blit(h2, (WIN_W // 2 - h2.get_width() // 2, self.start_btn.bottom + 20))
+
+    # --- Draft ---
+    def _draw_draft(self):
+        pname = "X" if self.draft_player == Mark.X else "O"
+        pcol = X_COLOR if self.draft_player == Mark.X else O_COLOR
+        title = self.f_lg.render("DRAFT POWER PIECES", True, (0, 212, 255))
+        self.screen.blit(title, (WIN_W // 2 - title.get_width() // 2, 40))
+        sub = self.f_md.render(f"Player {pname} - Choose 2", True, pcol)
+        self.screen.blit(sub, (WIN_W // 2 - sub.get_width() // 2, 90))
+        total = sum(self.draft_counts.values())
+        sel_text = self.f_sm.render(f"Selected: {total}/2", True, TEXT_COLOR)
+        self.screen.blit(sel_text, (WIN_W // 2 - sel_text.get_width() // 2, 128))
 
         mouse = pygame.mouse.get_pos()
-        hover = self.start_btn.collidepoint(mouse)
-        c = BUTTON_HOVER if hover else BUTTON_COLOR
-        pygame.draw.rect(self.screen, c, self.start_btn, border_radius=10)
-        pygame.draw.rect(self.screen, (0, 212, 255), self.start_btn, 2, border_radius=10)
-        txt = self.font_md.render("START GAME", True, BUTTON_TEXT)
-        self.screen.blit(txt, (self.start_btn.centerx - txt.get_width() // 2,
-                                self.start_btn.centery - txt.get_height() // 2))
+        for i, (pt, name, desc1, desc2) in enumerate(POWER_PIECE_INFO):
+            rect = self.card_rects[i]
+            cnt = self.draft_counts[pt]
+            hover = rect.collidepoint(mouse)
+            # Background
+            bg = (35, 55, 80) if hover else (20, 36, 56)
+            if cnt > 0:
+                bg = (40, 65, 95)
+            pygame.draw.rect(self.screen, bg, rect, border_radius=8)
+            # Border
+            bc = POWER_COLORS.get(pt.value, GRID_COLOR)
+            bw = 2 if cnt == 0 else 3
+            pygame.draw.rect(self.screen, bc, rect, bw, border_radius=8)
+            # Name
+            nt = self.f_md.render(name, True, bc)
+            self.screen.blit(nt, (rect.x + rect.w // 2 - nt.get_width() // 2, rect.y + 12))
+            # Description
+            d1 = self.f_sm.render(desc1, True, (160, 180, 200))
+            d2 = self.f_sm.render(desc2, True, (160, 180, 200))
+            self.screen.blit(d1, (rect.x + rect.w // 2 - d1.get_width() // 2, rect.y + 50))
+            self.screen.blit(d2, (rect.x + rect.w // 2 - d2.get_width() // 2, rect.y + 70))
+            # Count indicator
+            if cnt > 0:
+                ct = self.f_md.render(f"x{cnt}", True, SURGE_COLOR)
+                self.screen.blit(ct, (rect.x + rect.w // 2 - ct.get_width() // 2, rect.y + 98))
+            # Click hint
+            hint = "L-click: add  R-click: remove"
+            ht = self.f_sm.render(hint, True, (70, 90, 110))
+            # Only show hint at bottom of card area
+        # Hint below cards
+        ht = self.f_sm.render("Left-click: add | Right-click: remove", True, (70, 90, 110))
+        self.screen.blit(ht, (WIN_W // 2 - ht.get_width() // 2, self.confirm_btn.y - 26))
 
-        hint = self.font_sm.render("Place. Push. Decay. Anchor.", True, (80, 110, 140))
-        self.screen.blit(hint, (WIN_W // 2 - hint.get_width() // 2, self.start_btn.bottom + 20))
+        # Confirm button
+        can_confirm = total == 2
+        h = self.confirm_btn.collidepoint(mouse) and can_confirm
+        c = BUTTON_HOVER if h else (BUTTON_COLOR if can_confirm else (25, 35, 50))
+        pygame.draw.rect(self.screen, c, self.confirm_btn, border_radius=8)
+        bc = (0, 212, 255) if can_confirm else (40, 60, 80)
+        pygame.draw.rect(self.screen, bc, self.confirm_btn, 2, border_radius=8)
+        tc = BUTTON_TEXT if can_confirm else (60, 70, 80)
+        t = self.f_md.render("CONFIRM", True, tc)
+        self.screen.blit(t, (self.confirm_btn.centerx - t.get_width() // 2,
+                             self.confirm_btn.centery - t.get_height() // 2))
 
+    # --- Header ---
     def _draw_header(self):
-        title = self.font_title.render("DRIFT", True, (0, 212, 255))
-        self.screen.blit(title, (BOARD_X0, 14))
-        sub = self.font_sm.render("The Living Board Game", True, (100, 140, 170))
-        self.screen.blit(sub, (BOARD_X0, 48))
-
-        # Turn indicator
+        t = self.f_title.render("DRIFT", True, (0, 212, 255))
+        self.screen.blit(t, (BOARD_X0, 12))
+        s = self.f_sm.render("The Living Board Game", True, (100, 140, 170))
+        self.screen.blit(s, (BOARD_X0, 44))
         if self.phase != Phase.GAME_OVER:
-            player_name = "X" if self.current_player == Mark.X else "O"
-            color = X_COLOR if self.current_player == Mark.X else O_COLOR
-            phase_text = "PLACE" if self.phase == Phase.PLACE else "PUSH / ANCHOR / SKIP"
-            turn_surf = self.font_md.render(f"Player {player_name}", True, color)
-            phase_surf = self.font_sm.render(phase_text, True, PHASE_COLORS.get(self.phase.value, TEXT_COLOR))
-            self.screen.blit(turn_surf, (BOARD_X0 + BOARD_W - turn_surf.get_width(), 16))
-            self.screen.blit(phase_surf, (BOARD_X0 + BOARD_W - phase_surf.get_width(), 46))
+            pn = "X" if self.current_player == Mark.X else "O"
+            pc = X_COLOR if self.current_player == Mark.X else O_COLOR
+            ps = self.f_md.render(f"Player {pn}", True, pc)
+            if self.phase == Phase.PLACE:
+                pp_name = self.selected_pp.value.upper() if self.selected_pp else "NORMAL"
+                phase_text = f"PLACE ({pp_name})"
+                phase_col = (0, 212, 255)
+            elif self.phase == Phase.SURGE:
+                phase_text = "SURGE! BONUS ACTION"
+                phase_col = SURGE_COLOR
+            else:
+                phase_text = "PUSH / ANCHOR / SKIP"
+                phase_col = (255, 165, 0)
+            pt = self.f_sm.render(phase_text, True, phase_col)
+            self.screen.blit(ps, (BOARD_X0 + BOARD_W - ps.get_width(), 14))
+            self.screen.blit(pt, (BOARD_X0 + BOARD_W - pt.get_width(), 42))
 
+    # --- Sidebar ---
     def _draw_sidebar(self):
-        sidebar_rect = pygame.Rect(WIN_W - SIDEBAR_W, 0, SIDEBAR_W, WIN_H)
-        pygame.draw.rect(self.screen, SIDEBAR_BG, sidebar_rect)
-        x = WIN_W - SIDEBAR_W + 20
-        y = TOP_MARGIN
-
-        # Turn number
-        t = self.font_sm.render(f"Turn: {self.turn_number}", True, TEXT_COLOR)
-        self.screen.blit(t, (x, y))
-        y += 30
-
-        # Anchors remaining
-        for mark in (Mark.X, Mark.O):
-            color = X_COLOR if mark == Mark.X else O_COLOR
-            name = "X" if mark == Mark.X else "O"
-            remaining = self.anchors_remaining[mark]
-            txt = self.font_sm.render(f"{name} Anchors: {'*' * remaining}{'.' * (ANCHORS_PER_PLAYER - remaining)}", True, color)
-            self.screen.blit(txt, (x, y))
-            y += 24
-
-        y += 16
-        # Legend
-        legend_items = [
-            ("Bright = New piece", TEXT_COLOR),
-            ("Dim = Aging (decays at 6)", (100, 120, 140)),
-            ("Gold border = Anchored", ANCHOR_COLOR),
-        ]
-        for text, color in legend_items:
-            s = self.font_sm.render(text, True, color)
-            self.screen.blit(s, (x, y))
-            y += 22
-
-        y += 16
-        # Instructions summary
-        instructions = [
-            "HOW TO PLAY:",
-            "",
-            "1. PLACE your mark",
-            "2. Then: PUSH a row/col",
-            "   or ANCHOR a piece",
-            "   or SKIP",
-            "",
-            "Get 4 in a row to win!",
-            "",
-            "Pieces decay after 6 turns.",
-            "Pushed-off pieces wrap.",
-            "Anchored pieces resist pushes.",
-        ]
-        for line in instructions:
-            color = (0, 212, 255) if line == "HOW TO PLAY:" else (160, 180, 200)
-            s = self.font_sm.render(line, True, color)
-            self.screen.blit(s, (x, y))
+        sb = pygame.Rect(WIN_W - SIDEBAR_W, 0, SIDEBAR_W, WIN_H)
+        pygame.draw.rect(self.screen, SIDEBAR_BG, sb)
+        x = WIN_W - SIDEBAR_W + 15
+        y = TOP_MARGIN - 4
+        # Turn
+        self.screen.blit(self.f_sm.render(f"Turn: {self.turn_number}", True, TEXT_COLOR), (x, y))
+        y += 24
+        # Anchors
+        for m in (Mark.X, Mark.O):
+            c = X_COLOR if m == Mark.X else O_COLOR
+            n = "X" if m == Mark.X else "O"
+            rem = self.anchors[m]
+            self.screen.blit(self.f_sm.render(
+                f"{n} Anchors: {'*' * rem}{'.' * (ANCHORS_PER_PLAYER - rem)}", True, c), (x, y))
             y += 20
+        y += 8
+        # Power pieces
+        self.screen.blit(self.f_sm.render("POWER PIECES:", True, (0, 212, 255)), (x, y))
+        y += 22
+        self.pp_btns = []
+        bw, bh = 124, 28
+        for i, (pt, name, _, _) in enumerate(POWER_PIECE_INFO):
+            col_idx = i % 2
+            row_idx = i // 2
+            bx = x + col_idx * (bw + 6)
+            by = y + row_idx * (bh + 4)
+            rect = pygame.Rect(bx, by, bw, bh)
+            self.pp_btns.append((rect, pt))
+            avail = self.power_pieces[self.current_player].get(pt, 0)
+            is_sel = (self.selected_pp == pt)
+            mouse = pygame.mouse.get_pos()
+            hover = rect.collidepoint(mouse)
+            if avail > 0:
+                bg = (60, 50, 20) if is_sel else (BUTTON_HOVER if hover else BUTTON_COLOR)
+                pygame.draw.rect(self.screen, bg, rect, border_radius=4)
+                bc = POWER_COLORS.get(pt.value, GRID_COLOR) if is_sel else (60, 90, 120)
+                pygame.draw.rect(self.screen, bc, rect, 1, border_radius=4)
+                label = f"{name[:7]} x{avail}"
+                tc = POWER_COLORS.get(pt.value, TEXT_COLOR) if is_sel else BUTTON_TEXT
+            else:
+                pygame.draw.rect(self.screen, (22, 30, 42), rect, border_radius=4)
+                pygame.draw.rect(self.screen, (35, 45, 55), rect, 1, border_radius=4)
+                label = f"{name[:7]} x0"
+                tc = (55, 65, 75)
+            t = self.f_sm.render(label, True, tc)
+            self.screen.blit(t, (rect.x + rect.w // 2 - t.get_width() // 2,
+                                 rect.y + rect.h // 2 - t.get_height() // 2))
+        y += 2 * (bh + 4) + 10
 
+        # Zone legend
+        self.screen.blit(self.f_sm.render("ZONES:", True, (0, 212, 255)), (x, y))
+        y += 20
+        zone_info = [
+            ("Rift", "rift", "Eternal, no anchor"),
+            ("Accel", "accel", "2x aging speed"),
+            ("Warp", "warp", "Linked teleport"),
+        ]
+        for name, key, desc in zone_info:
+            c = ZONE_TEXT_COLORS[key]
+            self.screen.blit(self.f_sm.render(f"  {name}: {desc}", True, c), (x, y))
+            y += 18
+        y += 8
+
+        # Momentum
+        self.screen.blit(self.f_sm.render("MOMENTUM:", True, (0, 212, 255)), (x, y))
+        y += 20
+        self.screen.blit(self.f_sm.render("  Push 3-in-a-row = SURGE", True, SURGE_COLOR), (x, y))
+        y += 18
+        self.screen.blit(self.f_sm.render("  (bonus action!)", True, (140, 130, 60)), (x, y))
+        y += 24
+
+        # Quick ref
+        self.screen.blit(self.f_sm.render("HOW TO PLAY:", True, (0, 212, 255)), (x, y))
+        y += 20
+        for line in ["1. PLACE mark (or power)", "2. PUSH / ANCHOR / SKIP",
+                      "4-in-a-row wins!", "Decay after 6 turns",
+                      "R=restart  ESC=quit"]:
+            self.screen.blit(self.f_sm.render(f"  {line}", True, (130, 150, 170)), (x, y))
+            y += 18
+
+    # --- Board ---
     def _draw_board(self):
-        # Draw grid background
-        board_rect = pygame.Rect(BOARD_X0, BOARD_Y0, BOARD_W, BOARD_H)
-        pygame.draw.rect(self.screen, (14, 28, 48), board_rect)
+        br = pygame.Rect(BOARD_X0, BOARD_Y0, BOARD_W, BOARD_H)
+        pygame.draw.rect(self.screen, (14, 28, 48), br)
 
-        # Draw cells
-        for r in range(GRID_ROWS):
-            for c in range(GRID_COLS):
-                x = BOARD_X0 + c * CELL_SIZE
-                y = BOARD_Y0 + r * CELL_SIZE
-                cell_rect = pygame.Rect(x, y, CELL_SIZE, CELL_SIZE)
+        # Draw zones
+        for (r, c), zone in self.board.zones.items():
+            x = BOARD_X0 + c * CELL_SIZE
+            y = BOARD_Y0 + r * CELL_SIZE
+            key = zone.value
+            if key in ZONE_COLORS:
+                s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
+                s.fill(ZONE_COLORS[key])
+                self.screen.blit(s, (x, y))
+                tc = ZONE_TEXT_COLORS.get(key, TEXT_COLOR)
+                label = {"rift": "RIFT", "accel": "ACCEL", "warp": "WARP"}.get(key, "")
+                zt = self.f_zone.render(label, True, tc)
+                self.screen.blit(zt, (x + CELL_SIZE // 2 - zt.get_width() // 2, y + CELL_SIZE - 18))
 
-                # Hover highlight
-                if self.hovered_cell == (r, c) and not self.animating:
-                    if self.phase == Phase.PLACE and self.board.grid[r][c].mark == Mark.EMPTY:
-                        s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
-                        s.fill((255, 255, 255, 20))
-                        self.screen.blit(s, (x, y))
-                    elif self.anchor_mode and self.phase == Phase.ACTION:
-                        cell = self.board.grid[r][c]
-                        if cell.mark == self.current_player and not cell.anchored:
-                            s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
-                            s.fill((255, 215, 0, 30))
-                            self.screen.blit(s, (x, y))
+        # Draw warp connection line
+        warp_cells = [pos for pos, z in self.board.zones.items() if z == Zone.WARP]
+        if len(warp_cells) == 2:
+            (r1, c1), (r2, c2) = warp_cells
+            p1 = (BOARD_X0 + c1 * CELL_SIZE + CELL_SIZE // 2, BOARD_Y0 + r1 * CELL_SIZE + CELL_SIZE // 2)
+            p2 = (BOARD_X0 + c2 * CELL_SIZE + CELL_SIZE // 2, BOARD_Y0 + r2 * CELL_SIZE + CELL_SIZE // 2)
+            pygame.draw.line(self.screen, (80, 40, 120), p1, p2, 1)
 
-                cell = self.board.grid[r][c]
-                if cell.mark != Mark.EMPTY:
-                    self._draw_mark(x, y, cell)
+        # Hover highlight
+        if self.hovered_cell and not self.animating:
+            hr, hc = self.hovered_cell
+            hx = BOARD_X0 + hc * CELL_SIZE
+            hy = BOARD_Y0 + hr * CELL_SIZE
+            if self.phase == Phase.PLACE and self.board.grid[hr][hc].mark == Mark.EMPTY:
+                s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
+                s.fill((255, 255, 255, 20))
+                self.screen.blit(s, (hx, hy))
+            elif self.anchor_mode and self.phase in (Phase.ACTION, Phase.SURGE):
+                cell = self.board.grid[hr][hc]
+                if cell.mark == self.current_player and not cell.anchored:
+                    s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
+                    s.fill((255, 215, 0, 25))
+                    self.screen.blit(s, (hx, hy))
+
+        # Draw pieces (or animation)
+        if self.animating:
+            self._draw_anim_pieces()
+        else:
+            for r in range(GRID_ROWS):
+                for c in range(GRID_COLS):
+                    cell = self.board.grid[r][c]
+                    if cell.mark != Mark.EMPTY:
+                        self._draw_mark(BOARD_X0 + c * CELL_SIZE, BOARD_Y0 + r * CELL_SIZE, cell)
 
         # Grid lines
         for i in range(GRID_COLS + 1):
@@ -583,272 +907,286 @@ class DriftGame:
         if self.win_line:
             self._draw_win_line()
 
-    def _draw_board_animating(self):
-        board_rect = pygame.Rect(BOARD_X0, BOARD_Y0, BOARD_W, BOARD_H)
-        pygame.draw.rect(self.screen, (14, 28, 48), board_rect)
-
+    def _draw_anim_pieces(self):
         t = (pygame.time.get_ticks() - self.anim_start) / (ANIM_DURATION * 1000)
         t = min(t, 1.0)
-        # Ease out
-        t = 1 - (1 - t) ** 3
+        t = 1 - (1 - t) ** 3  # ease out
 
-        # Draw animated pieces
-        for (or_, oc, nr, nc, mark, age, anchored) in self.anim_moves:
-            # Interpolate position, handling wrap-around
-            ox = BOARD_X0 + oc * CELL_SIZE
-            oy = BOARD_Y0 + or_ * CELL_SIZE
-            nx = BOARD_X0 + nc * CELL_SIZE
-            ny = BOARD_Y0 + nr * CELL_SIZE
-
-            # Handle wrapping: if distance is more than 2 cells, piece wraps
-            dx = nx - ox
-            dy = ny - oy
+        for (or_, oc, nr, nc, mark, age, anchored, ptype, ph_turns) in self.anim_moves:
+            ox, oy = BOARD_X0 + oc * CELL_SIZE, BOARD_Y0 + or_ * CELL_SIZE
+            nx, ny = BOARD_X0 + nc * CELL_SIZE, BOARD_Y0 + nr * CELL_SIZE
+            dx, dy = nx - ox, ny - oy
             if abs(dx) > CELL_SIZE * 2:
-                if dx > 0:
-                    dx -= BOARD_W
-                else:
-                    dx += BOARD_W
+                dx += -BOARD_W if dx > 0 else BOARD_W
             if abs(dy) > CELL_SIZE * 2:
-                if dy > 0:
-                    dy -= BOARD_H
-                else:
-                    dy += BOARD_H
+                dy += -BOARD_H if dy > 0 else BOARD_H
+            temp = Cell()
+            temp.mark = mark
+            temp.age = age
+            temp.anchored = anchored
+            temp.piece_type = ptype
+            temp.phantom_turns = ph_turns
+            self._draw_mark(ox + dx * t, oy + dy * t, temp)
 
-            cx = ox + dx * t
-            cy = oy + dy * t
-
-            # Create temporary cell for drawing
-            temp_cell = Cell()
-            temp_cell.mark = mark
-            temp_cell.age = age
-            temp_cell.anchored = anchored
-            self._draw_mark(cx, cy, temp_cell)
-
-        # Draw non-moving pieces (those not in the animated axis)
-        # Actually all moving pieces are captured in anim_moves.
-        # Draw pieces NOT in the animated set
-        animated_destinations = set()
-        for (_, _, nr, nc, _, _, _) in self.anim_moves:
-            animated_destinations.add((nr, nc))
-
+        # Non-animated pieces
+        anim_dests = {(nr, nc) for (_, _, nr, nc, *_) in self.anim_moves}
         for r in range(GRID_ROWS):
             for c in range(GRID_COLS):
-                if (r, c) not in animated_destinations:
+                if (r, c) not in anim_dests:
                     cell = self.board.grid[r][c]
                     if cell.mark != Mark.EMPTY:
-                        x = BOARD_X0 + c * CELL_SIZE
-                        y = BOARD_Y0 + r * CELL_SIZE
-                        self._draw_mark(x, y, cell)
+                        self._draw_mark(BOARD_X0 + c * CELL_SIZE, BOARD_Y0 + r * CELL_SIZE, cell)
 
-        # Grid lines
-        for i in range(GRID_COLS + 1):
-            lx = BOARD_X0 + i * CELL_SIZE
-            pygame.draw.line(self.screen, GRID_COLOR, (lx, BOARD_Y0), (lx, BOARD_Y0 + BOARD_H), 2)
-        for i in range(GRID_ROWS + 1):
-            ly = BOARD_Y0 + i * CELL_SIZE
-            pygame.draw.line(self.screen, GRID_COLOR, (BOARD_X0, ly), (BOARD_X0 + BOARD_W, ly), 2)
-
-        # Check if animation done
         if t >= 1.0:
             self.animating = False
-            if self.pending_winner_check:
-                self.pending_winner_check = False
-                self.end_turn()
+            if self.pending_post_push:
+                self.pending_post_push = False
+                self._on_push_complete()
 
     def _draw_mark(self, x, y, cell):
-        cx = x + CELL_SIZE // 2
-        cy = y + CELL_SIZE // 2
-        # Fade based on age
-        fade = max(0.2, 1.0 - (cell.age / (MAX_AGE + 1)) * 0.8)
+        cx = int(x + CELL_SIZE // 2)
+        cy = int(y + CELL_SIZE // 2)
+        max_a = SENTINEL_DECAY if cell.piece_type == PieceType.SENTINEL else MAX_AGE
+        fade = max(0.2, 1.0 - (cell.age / (max_a + 1)) * 0.8)
         sz = int(CELL_SIZE * 0.32)
+        is_phantom = cell.piece_type == PieceType.PHANTOM and cell.phantom_turns > 0
+        if is_phantom:
+            fade *= 0.5  # ghostly
+
+        base = X_COLOR if cell.mark == Mark.X else O_COLOR
+        color = tuple(int(c * fade) for c in base)
+        lw = max(3, int(5 * fade))
 
         if cell.mark == Mark.X:
-            color = tuple(int(c * fade) for c in X_COLOR)
-            lw = max(3, int(5 * fade))
-            pygame.draw.line(self.screen, color, (cx - sz, cy - sz), (cx + sz, cy + sz), lw)
-            pygame.draw.line(self.screen, color, (cx + sz, cy - sz), (cx - sz, cy + sz), lw)
+            if is_phantom:
+                # Dashed X
+                for frac in [0.0, 0.3, 0.6]:
+                    s = frac
+                    e = min(frac + 0.2, 1.0)
+                    pygame.draw.line(self.screen, color,
+                                     (int(cx - sz + 2 * sz * s), int(cy - sz + 2 * sz * s)),
+                                     (int(cx - sz + 2 * sz * e), int(cy - sz + 2 * sz * e)), lw)
+                    pygame.draw.line(self.screen, color,
+                                     (int(cx + sz - 2 * sz * s), int(cy - sz + 2 * sz * s)),
+                                     (int(cx + sz - 2 * sz * e), int(cy - sz + 2 * sz * e)), lw)
+            else:
+                pygame.draw.line(self.screen, color, (cx - sz, cy - sz), (cx + sz, cy + sz), lw)
+                pygame.draw.line(self.screen, color, (cx + sz, cy - sz), (cx - sz, cy + sz), lw)
         elif cell.mark == Mark.O:
-            color = tuple(int(c * fade) for c in O_COLOR)
-            lw = max(3, int(5 * fade))
-            pygame.draw.circle(self.screen, color, (cx, cy), sz, lw)
+            if is_phantom:
+                # Dashed circle
+                for angle in range(0, 360, 40):
+                    a1 = math.radians(angle)
+                    a2 = math.radians(angle + 20)
+                    pygame.draw.line(self.screen, color,
+                                     (int(cx + sz * math.cos(a1)), int(cy + sz * math.sin(a1))),
+                                     (int(cx + sz * math.cos(a2)), int(cy + sz * math.sin(a2))), lw)
+            else:
+                pygame.draw.circle(self.screen, color, (cx, cy), sz, lw)
+
+        # Power piece type indicator
+        if cell.piece_type != PieceType.NORMAL:
+            pt_col = POWER_COLORS.get(cell.piece_type.value, TEXT_COLOR)
+            pt_col = tuple(int(c * fade) for c in pt_col)
+            label = {"phantom": "Ph", "catalyst": "Ca", "leech": "Le", "sentinel": "Se"
+                     }.get(cell.piece_type.value, "")
+            if cell.piece_type == PieceType.CATALYST:
+                # Small radiating dots
+                for angle in [0, 90, 180, 270]:
+                    a = math.radians(angle)
+                    dx = int(math.cos(a) * (sz + 8))
+                    dy = int(math.sin(a) * (sz + 8))
+                    pygame.draw.circle(self.screen, pt_col, (cx + dx, cy + dy), 2)
+            if label:
+                lt = self.f_zone.render(label, True, pt_col)
+                self.screen.blit(lt, (int(x + CELL_SIZE - 22), int(y + 4)))
 
         # Anchor indicator
         if cell.anchored:
             pygame.draw.rect(self.screen, ANCHOR_COLOR,
-                             (x + 4, y + 4, CELL_SIZE - 8, CELL_SIZE - 8), 2)
-            # Small anchor icon (diamond) in corner
-            ax, ay = x + 16, y + 16
-            diamond_sz = 6
-            pts = [(ax, ay - diamond_sz), (ax + diamond_sz, ay),
-                   (ax, ay + diamond_sz), (ax - diamond_sz, ay)]
-            pygame.draw.polygon(self.screen, ANCHOR_COLOR, pts)
+                             (int(x + 4), int(y + 4), CELL_SIZE - 8, CELL_SIZE - 8), 2)
+            ax, ay = int(x + 16), int(y + 16)
+            d = 5
+            pygame.draw.polygon(self.screen, ANCHOR_COLOR,
+                                [(ax, ay - d), (ax + d, ay), (ax, ay + d), (ax - d, ay)])
 
-        # Age indicator (small dots at bottom)
+        # Age dots
         if cell.mark != Mark.EMPTY:
-            for i in range(MAX_AGE):
-                dot_x = cx - (MAX_AGE * 4) // 2 + i * 8 + 4
-                dot_y = y + CELL_SIZE - 12
-                if i < cell.age:
-                    pygame.draw.circle(self.screen, (80, 50, 50) if cell.mark == Mark.X else (30, 70, 50),
-                                       (dot_x, dot_y), 2)
-                else:
-                    pygame.draw.circle(self.screen, (40, 50, 60), (dot_x, dot_y), 2)
-
-    def _draw_arrows(self):
-        if self.phase != Phase.ACTION or self.animating or self.anchor_mode:
-            # Draw dimmed arrows
-            for arrow in self.arrows:
-                pygame.draw.polygon(self.screen, (30, 45, 60), arrow.points)
-            return
-        for arrow in self.arrows:
-            color = ARROW_HOVER if arrow == self.hovered_arrow else ARROW_COLOR
-            pygame.draw.polygon(self.screen, color, arrow.points)
-
-    def _draw_action_buttons(self):
-        mouse = pygame.mouse.get_pos()
-
-        # Skip button
-        hover = self.skip_btn.collidepoint(mouse)
-        color = BUTTON_HOVER if hover else BUTTON_COLOR
-        pygame.draw.rect(self.screen, color, self.skip_btn, border_radius=6)
-        pygame.draw.rect(self.screen, GRID_COLOR, self.skip_btn, 1, border_radius=6)
-        txt = self.font_sm.render("Skip", True, BUTTON_TEXT)
-        self.screen.blit(txt, (self.skip_btn.centerx - txt.get_width() // 2,
-                                self.skip_btn.centery - txt.get_height() // 2))
-
-        # Anchor button
-        can_anchor = self.anchors_remaining[self.current_player] > 0
-        if can_anchor:
-            hover = self.anchor_btn.collidepoint(mouse)
-            color = (80, 70, 20) if self.anchor_mode else (BUTTON_HOVER if hover else BUTTON_COLOR)
-            pygame.draw.rect(self.screen, color, self.anchor_btn, border_radius=6)
-            border_c = ANCHOR_COLOR if self.anchor_mode else GRID_COLOR
-            pygame.draw.rect(self.screen, border_c, self.anchor_btn, 1, border_radius=6)
-            label = "Anchoring..." if self.anchor_mode else "Anchor"
-            txt = self.font_sm.render(label, True, ANCHOR_COLOR if self.anchor_mode else BUTTON_TEXT)
-        else:
-            pygame.draw.rect(self.screen, (30, 30, 40), self.anchor_btn, border_radius=6)
-            txt = self.font_sm.render("No Anchors", True, (80, 80, 90))
-        self.screen.blit(txt, (self.anchor_btn.centerx - txt.get_width() // 2,
-                                self.anchor_btn.centery - txt.get_height() // 2))
+            for i in range(max_a):
+                dx = cx - (max_a * 4) // 2 + i * 8 + 4
+                dy = int(y + CELL_SIZE - 12)
+                filled = i < cell.age
+                dc = ((80, 50, 50) if cell.mark == Mark.X else (30, 70, 50)) if filled else (40, 50, 60)
+                pygame.draw.circle(self.screen, dc, (dx, dy), 2)
 
     def _draw_win_line(self):
-        if not self.win_line:
-            return
-        elapsed = (pygame.time.get_ticks() - self.win_time) / 1000.0
-        alpha = int(abs(math.sin(elapsed * 3)) * 200 + 55)
         r0, c0 = self.win_line[0]
         r1, c1 = self.win_line[-1]
-        x0 = BOARD_X0 + c0 * CELL_SIZE + CELL_SIZE // 2
-        y0 = BOARD_Y0 + r0 * CELL_SIZE + CELL_SIZE // 2
-        x1 = BOARD_X0 + c1 * CELL_SIZE + CELL_SIZE // 2
-        y1 = BOARD_Y0 + r1 * CELL_SIZE + CELL_SIZE // 2
-        # Draw glowing line
-        for w in (8, 5, 2):
-            c = (255, 255, 255) if w == 2 else ((200, 220, 255) if w == 5 else (100, 150, 200))
-            pygame.draw.line(self.screen, c, (x0, y0), (x1, y1), w)
+        p0 = (BOARD_X0 + c0 * CELL_SIZE + CELL_SIZE // 2, BOARD_Y0 + r0 * CELL_SIZE + CELL_SIZE // 2)
+        p1 = (BOARD_X0 + c1 * CELL_SIZE + CELL_SIZE // 2, BOARD_Y0 + r1 * CELL_SIZE + CELL_SIZE // 2)
+        for w, c in [(8, (100, 150, 200)), (5, (200, 220, 255)), (2, (255, 255, 255))]:
+            pygame.draw.line(self.screen, c, p0, p1, w)
 
-    def _draw_game_over(self):
-        overlay = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 140))
-        self.screen.blit(overlay, (0, 0))
+    # --- Arrows ---
+    def _draw_arrows(self):
+        active = self.phase in (Phase.ACTION, Phase.SURGE) and not self.animating and not self.anchor_mode
+        for arrow in self.arrows:
+            if active:
+                c = ARROW_HOVER if arrow == self.hovered_arrow else ARROW_COLOR
+            else:
+                c = (30, 45, 60)
+            pygame.draw.polygon(self.screen, c, arrow.points)
 
-        if self.winner:
-            name = "X" if self.winner == Mark.X else "O"
-            color = X_COLOR if self.winner == Mark.X else O_COLOR
-            txt = self.font_xl.render(f"Player {name} Wins!", True, color)
-        else:
-            txt = self.font_xl.render("Draw!", True, TEXT_COLOR)
-        self.screen.blit(txt, (WIN_W // 2 - txt.get_width() // 2, WIN_H // 2 - 50))
-
+    # --- Action buttons ---
+    def _draw_action_buttons(self):
         mouse = pygame.mouse.get_pos()
-        hover = self.restart_btn.collidepoint(mouse)
-        c = BUTTON_HOVER if hover else BUTTON_COLOR
-        pygame.draw.rect(self.screen, c, self.restart_btn, border_radius=8)
-        pygame.draw.rect(self.screen, GRID_COLOR, self.restart_btn, 2, border_radius=8)
-        txt = self.font_md.render("Play Again", True, BUTTON_TEXT)
-        self.screen.blit(txt, (self.restart_btn.centerx - txt.get_width() // 2,
-                                self.restart_btn.centery - txt.get_height() // 2))
+        # Skip
+        h = self.skip_btn.collidepoint(mouse)
+        pygame.draw.rect(self.screen, BUTTON_HOVER if h else BUTTON_COLOR, self.skip_btn, border_radius=6)
+        pygame.draw.rect(self.screen, GRID_COLOR, self.skip_btn, 1, border_radius=6)
+        t = self.f_sm.render("Skip", True, BUTTON_TEXT)
+        self.screen.blit(t, (self.skip_btn.centerx - t.get_width() // 2,
+                             self.skip_btn.centery - t.get_height() // 2))
+        # Anchor
+        can = self.anchors[self.current_player] > 0
+        if can:
+            h = self.anchor_btn.collidepoint(mouse)
+            bg = (80, 70, 20) if self.anchor_mode else (BUTTON_HOVER if h else BUTTON_COLOR)
+            pygame.draw.rect(self.screen, bg, self.anchor_btn, border_radius=6)
+            bc = ANCHOR_COLOR if self.anchor_mode else GRID_COLOR
+            pygame.draw.rect(self.screen, bc, self.anchor_btn, 1, border_radius=6)
+            label = "Anchoring..." if self.anchor_mode else "Anchor"
+            tc = ANCHOR_COLOR if self.anchor_mode else BUTTON_TEXT
+        else:
+            pygame.draw.rect(self.screen, (30, 30, 40), self.anchor_btn, border_radius=6)
+            label = "No Anchors"
+            tc = (80, 80, 90)
+        t = self.f_sm.render(label, True, tc)
+        self.screen.blit(t, (self.anchor_btn.centerx - t.get_width() // 2,
+                             self.anchor_btn.centery - t.get_height() // 2))
 
-        hint = self.font_sm.render("Press R to restart", True, (80, 110, 140))
-        self.screen.blit(hint, (WIN_W // 2 - hint.get_width() // 2, self.restart_btn.bottom + 12))
+        # Surge indicator
+        if self.phase == Phase.SURGE:
+            pulse = abs(math.sin(pygame.time.get_ticks() / 300))
+            sc = tuple(int(c * (0.6 + 0.4 * pulse)) for c in SURGE_COLOR)
+            st = self.f_md.render("SURGE!", True, sc)
+            self.screen.blit(st, (self.skip_btn.x, self.skip_btn.y - 30))
+
+    # --- Game over ---
+    def _draw_game_over(self):
+        ov = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        ov.fill((0, 0, 0, 140))
+        self.screen.blit(ov, (0, 0))
+        if self.winner:
+            n = "X" if self.winner == Mark.X else "O"
+            c = X_COLOR if self.winner == Mark.X else O_COLOR
+            t = self.f_xl.render(f"Player {n} Wins!", True, c)
+        else:
+            t = self.f_xl.render("Draw!", True, TEXT_COLOR)
+        self.screen.blit(t, (WIN_W // 2 - t.get_width() // 2, WIN_H // 2 - 50))
+        mouse = pygame.mouse.get_pos()
+        h = self.restart_btn.collidepoint(mouse)
+        pygame.draw.rect(self.screen, BUTTON_HOVER if h else BUTTON_COLOR, self.restart_btn, border_radius=8)
+        pygame.draw.rect(self.screen, GRID_COLOR, self.restart_btn, 2, border_radius=8)
+        t = self.f_md.render("Play Again", True, BUTTON_TEXT)
+        self.screen.blit(t, (self.restart_btn.centerx - t.get_width() // 2,
+                             self.restart_btn.centery - t.get_height() // 2))
+        h2 = self.f_sm.render("Press R to restart", True, (80, 110, 140))
+        self.screen.blit(h2, (WIN_W // 2 - h2.get_width() // 2, self.restart_btn.bottom + 12))
 
     def _draw_message(self):
-        elapsed = pygame.time.get_ticks() - self.message_timer
-        if elapsed > 2000:
+        elapsed = pygame.time.get_ticks() - self.msg_time
+        if elapsed > 2500:
             return
-        alpha = 255 if elapsed < 1500 else int(255 * (2000 - elapsed) / 500)
-        txt = self.font_sm.render(self.message, True, (255, 200, 100))
-        self.screen.blit(txt, (BOARD_X0, BOARD_Y0 + BOARD_H + ARROW_MARGIN + 4))
+        t = self.f_sm.render(self.message, True, SURGE_COLOR if "SURGE" in self.message else (255, 200, 100))
+        self.screen.blit(t, (BOARD_X0, BOARD_Y0 + BOARD_H + ARROW_MARGIN + 4))
 
     # ------------------------------------------------------------------
     # Input
     # ------------------------------------------------------------------
-    def handle_click(self, pos):
+    def handle_click(self, pos, button=1):
         if self.animating:
             return
 
-        # Title screen
         if self.phase == Phase.TITLE:
             if self.start_btn.collidepoint(pos):
-                self.reset_game()
+                self.start_draft()
             return
 
-        # Game over - restart button
+        if self.phase == Phase.DRAFT:
+            self._handle_draft_click(pos, button)
+            return
+
         if self.phase == Phase.GAME_OVER:
             if self.restart_btn.collidepoint(pos):
                 self.reset_game()
             return
 
-        # Action phase buttons
-        if self.phase == Phase.ACTION:
+        # Sidebar power piece buttons (during PLACE)
+        if self.phase == Phase.PLACE:
+            for rect, pt in self.pp_btns:
+                if rect.collidepoint(pos):
+                    avail = self.power_pieces[self.current_player].get(pt, 0)
+                    if avail > 0:
+                        self.selected_pp = pt if self.selected_pp != pt else None
+                    return
+
+        # Action buttons
+        if self.phase in (Phase.ACTION, Phase.SURGE):
             if self.skip_btn.collidepoint(pos):
                 self.do_skip()
                 return
-            if self.anchor_btn.collidepoint(pos) and self.anchors_remaining[self.current_player] > 0:
+            if self.anchor_btn.collidepoint(pos) and self.anchors[self.current_player] > 0:
                 self.anchor_mode = not self.anchor_mode
                 return
 
         # Board clicks
-        bx = pos[0] - BOARD_X0
-        by = pos[1] - BOARD_Y0
+        bx, by = pos[0] - BOARD_X0, pos[1] - BOARD_Y0
         if 0 <= bx < BOARD_W and 0 <= by < BOARD_H:
             c = bx // CELL_SIZE
             r = by // CELL_SIZE
             if self.phase == Phase.PLACE:
                 self.do_place(r, c)
-            elif self.phase == Phase.ACTION and self.anchor_mode:
+            elif self.phase in (Phase.ACTION, Phase.SURGE) and self.anchor_mode:
                 self.do_anchor(r, c)
             return
 
-        # Arrow clicks (push)
-        if self.phase == Phase.ACTION and not self.anchor_mode:
+        # Arrow clicks
+        if self.phase in (Phase.ACTION, Phase.SURGE) and not self.anchor_mode:
             for arrow in self.arrows:
                 if arrow.contains(pos):
                     self.do_push(arrow)
                     return
 
+    def _handle_draft_click(self, pos, button):
+        total = sum(self.draft_counts.values())
+        for i, (pt, *_) in enumerate(POWER_PIECE_INFO):
+            if self.card_rects[i].collidepoint(pos):
+                if button == 1:  # left click - add
+                    if total < 2 and self.draft_counts[pt] < 2:
+                        self.draft_counts[pt] += 1
+                elif button == 3:  # right click - remove
+                    if self.draft_counts[pt] > 0:
+                        self.draft_counts[pt] -= 1
+                return
+        if self.confirm_btn.collidepoint(pos):
+            if total == 2:
+                self.confirm_draft()
+
     def handle_mouse_move(self, pos):
         self.hovered_arrow = None
         self.hovered_cell = None
-
-        # Check board hover
-        bx = pos[0] - BOARD_X0
-        by = pos[1] - BOARD_Y0
+        bx, by = pos[0] - BOARD_X0, pos[1] - BOARD_Y0
         if 0 <= bx < BOARD_W and 0 <= by < BOARD_H:
-            c = bx // CELL_SIZE
-            r = by // CELL_SIZE
-            self.hovered_cell = (r, c)
-
-        # Check arrow hover
-        if self.phase == Phase.ACTION and not self.anchor_mode:
+            self.hovered_cell = (by // CELL_SIZE, bx // CELL_SIZE)
+        if self.phase in (Phase.ACTION, Phase.SURGE) and not self.anchor_mode:
             for arrow in self.arrows:
                 if arrow.contains(pos):
                     self.hovered_arrow = arrow
                     break
 
     # ------------------------------------------------------------------
-    # Main Loop
+    # Main loop
     # ------------------------------------------------------------------
     def run(self):
         running = True
@@ -856,8 +1194,8 @@ class DriftGame:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    self.handle_click(event.pos)
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+                    self.handle_click(event.pos, event.button)
                 elif event.type == pygame.MOUSEMOTION:
                     self.handle_mouse_move(event.pos)
                 elif event.type == pygame.KEYDOWN:
@@ -865,17 +1203,11 @@ class DriftGame:
                         self.reset_game()
                     elif event.key == pygame.K_ESCAPE:
                         running = False
-
             self.draw()
             self.clock.tick(FPS)
-
         pygame.quit()
         sys.exit()
 
 
-# ---------------------------------------------------------------------------
-# Entry Point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    game = DriftGame()
-    game.run()
+    DriftGame().run()
