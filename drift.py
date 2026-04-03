@@ -4,12 +4,15 @@ An evolution of tic-tac-toe where the board is alive.
 Place. Push. Decay. Anchor. Draft. Surge.
 """
 
+import os
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 import pygame
 import sys
 import math
-import os
 import random
+import threading
 from enum import Enum
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -153,6 +156,12 @@ class Cell:
         if self.piece_type == PieceType.PHANTOM and self.phantom_turns > 0:
             return True
         return False
+
+    def __getstate__(self):
+        return (self.mark, self.age, self.anchored, self.piece_type, self.phantom_turns)
+
+    def __setstate__(self, state):
+        self.mark, self.age, self.anchored, self.piece_type, self.phantom_turns = state
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +357,7 @@ class Board:
 
 
 # ---------------------------------------------------------------------------
-# AI
+# Standalone AI helpers (module-level for multiprocessing pickling)
 # ---------------------------------------------------------------------------
 _WIN_LINES = []
 for _r in range(GRID_ROWS):
@@ -358,21 +367,202 @@ for _c in range(GRID_COLS):
 _WIN_LINES.append([(_i, _i) for _i in range(4)])
 _WIN_LINES.append([(_i, 3 - _i) for _i in range(4)])
 
+_PUSH_SPECS = []
+for _c in range(GRID_COLS):
+    _PUSH_SPECS.append(("col", _c, 1))
+for _c in range(GRID_COLS):
+    _PUSH_SPECS.append(("col", _c, -1))
+for _r in range(GRID_ROWS):
+    _PUSH_SPECS.append(("row", _r, 1))
+for _r in range(GRID_ROWS):
+    _PUSH_SPECS.append(("row", _r, -1))
+
+
+def _eval_board(board, ai_mark, ai_opp):
+    """Standalone board evaluation (no pygame, picklable)."""
+    w, _ = board.check_winner()
+    if w == ai_mark:
+        return 100000
+    if w == ai_opp:
+        return -100000
+    score = 0
+    for line in _WIN_LINES:
+        own = opp = 0
+        for r, c in line:
+            m = board.grid[r][c].mark
+            if m == ai_mark:
+                own += 1
+            elif m == ai_opp:
+                opp += 1
+        # Unblocked lines only (if both players have pieces, line is dead)
+        if opp == 0 and own > 0:
+            score += (0, 8, 80, 2000)[own]
+        if own == 0 and opp > 0:
+            score -= (0, 8, 80, 2000)[opp]
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            cell = board.grid[r][c]
+            if cell.mark == Mark.EMPTY:
+                continue
+            mult = 1 if cell.mark == ai_mark else -1
+            zone = board.zones.get((r, c), Zone.NONE)
+            if zone == Zone.RIFT:
+                score += 40 * mult
+            elif zone == Zone.ACCELERATOR:
+                score -= 12 * mult
+            max_a = SENTINEL_DECAY if cell.piece_type == PieceType.SENTINEL else MAX_AGE
+            score += max(0, max_a - cell.age) * 2 * mult
+            if cell.anchored:
+                score += 18 * mult
+            if (r, c) in ((1, 1), (1, 2), (2, 1), (2, 2)):
+                score += 6 * mult
+    return score
+
+
+def _sim_push(board, axis, index, direction):
+    bc = board.copy()
+    ml = bc.push(axis, index, direction)
+    bc.apply_catalyst_effects(ml)
+    bc.apply_warp_effects(ml)
+    return bc
+
+
+def _action_boards(board, mark, anchors_left):
+    results = [board]
+    for axis, idx, d in _PUSH_SPECS:
+        results.append(_sim_push(board, axis, idx, d))
+    if anchors_left > 0:
+        for r in range(GRID_ROWS):
+            for c in range(GRID_COLS):
+                cell = board.grid[r][c]
+                if cell.mark == mark and not cell.anchored:
+                    zone = board.zones.get((r, c), Zone.NONE)
+                    if zone != Zone.RIFT:
+                        bc = board.copy()
+                        bc.grid[r][c].anchored = True
+                        results.append(bc)
+    return results
+
+
+def _can_surge_win(board, mark):
+    """Can `mark` win via place + push(3-in-a-row) + surge-push(4-in-a-row)?"""
+    empties = [(r, c) for r in range(GRID_ROWS) for c in range(GRID_COLS)
+               if board.grid[r][c].mark == Mark.EMPTY]
+    for r, c in empties:
+        bc = board.copy()
+        bc.place(r, c, mark, PieceType.NORMAL)
+        w, _ = bc.check_winner()
+        if w == mark:
+            return True
+        for axis, idx, d in _PUSH_SPECS:
+            ab = _sim_push(bc, axis, idx, d)
+            w, _ = ab.check_winner()
+            if w == mark:
+                return True
+            if ab.has_three_in_a_row(mark):
+                for a2, i2, d2 in _PUSH_SPECS:
+                    ab2 = _sim_push(ab, a2, i2, d2)
+                    w2, _ = ab2.check_winner()
+                    if w2 == mark:
+                        return True
+    return False
+
+
+def _counter_score(board, ai_mark, ai_opp):
+    """Our best counter-response score (3rd ply)."""
+    empties = [(r, c) for r in range(GRID_ROWS) for c in range(GRID_COLS)
+               if board.grid[r][c].mark == Mark.EMPTY]
+    if not empties:
+        return _eval_board(board, ai_mark, ai_opp)
+    scored = []
+    tie = 0
+    for r, c in empties:
+        bc = board.copy()
+        bc.place(r, c, ai_mark, PieceType.NORMAL)
+        scored.append((_eval_board(bc, ai_mark, ai_opp), tie, r, c))
+        tie += 1
+    scored.sort(reverse=True)
+    best = _eval_board(board, ai_mark, ai_opp)
+    for _, _, r, c in scored[:6]:
+        bc = board.copy()
+        bc.place(r, c, ai_mark, PieceType.NORMAL)
+        for ab in _action_boards(bc, ai_mark, 0):
+            s = _eval_board(ab, ai_mark, ai_opp)
+            if s > best:
+                best = s
+    return best
+
+
+def _worker_deep_eval(board, ai_mark, ai_opp, opp_type_vals, opp_anchors):
+    """Worker function for parallel deep evaluation.
+    Models opponent's best response (with surge) + our counter-response."""
+    opp_types = [PieceType(v) for v in opp_type_vals]
+    empties = [(r, c) for r in range(GRID_ROWS) for c in range(GRID_COLS)
+               if board.grid[r][c].mark == Mark.EMPTY]
+    if not empties:
+        return _eval_board(board, ai_mark, ai_opp)
+    opp_cands = []
+    tie = 0
+    for r, c in empties:
+        for pt in opp_types:
+            bc = board.copy()
+            bc.place(r, c, ai_opp, pt)
+            if pt == PieceType.LEECH:
+                bc.apply_leech(r, c)
+            opp_cands.append((-_eval_board(bc, ai_mark, ai_opp), tie, r, c, pt))
+            tie += 1
+    opp_cands.sort()
+    top_n = min(len(opp_cands), 12)
+    worst = 999999
+    for _, _, r, c, pt in opp_cands[:top_n]:
+        bc = board.copy()
+        bc.place(r, c, ai_opp, pt)
+        if pt == PieceType.LEECH:
+            bc.apply_leech(r, c)
+        best_opp = -999999
+        for ab in _action_boards(bc, ai_opp, opp_anchors):
+            # Check if opponent (player X) earns a surge from this push
+            effective_board = ab
+            if ab.has_three_in_a_row(ai_opp):
+                # Opponent gets a bonus action — model their best bonus push
+                w_check, _ = ab.check_winner()
+                if w_check != ai_opp:  # not already a win
+                    surge_best_score = _eval_board(ab, ai_opp, ai_mark)
+                    surge_best_board = ab
+                    for axis, idx, d in _PUSH_SPECS:
+                        ab2 = _sim_push(ab, axis, idx, d)
+                        s = _eval_board(ab2, ai_opp, ai_mark)
+                        if s > surge_best_score:
+                            surge_best_score = s
+                            surge_best_board = ab2
+                    effective_board = surge_best_board
+            counter = _counter_score(effective_board, ai_mark, ai_opp)
+            opp_g = -counter
+            if opp_g > best_opp:
+                best_opp = opp_g
+        score_for_us = -best_opp
+        if score_for_us < worst:
+            worst = score_for_us
+    return worst
+
 
 class DriftAI:
     """AI opponent for DRIFT. Plays as Mark.O."""
 
     DRAFT_PICKS = {
-        "easy": None,  # random
-        "medium": [
+        "easy": [
             {PieceType.LEECH: 1, PieceType.SENTINEL: 1},
             {PieceType.PHANTOM: 1, PieceType.LEECH: 1},
             {PieceType.CATALYST: 1, PieceType.SENTINEL: 1},
         ],
-        "hard": [
+        "medium": [
             {PieceType.LEECH: 1, PieceType.CATALYST: 1},
             {PieceType.LEECH: 2},
             {PieceType.PHANTOM: 1, PieceType.CATALYST: 1},
+        ],
+        "hard": [
+            {PieceType.LEECH: 1, PieceType.CATALYST: 1},
+            {PieceType.LEECH: 1, PieceType.PHANTOM: 1},
         ],
     }
 
@@ -380,50 +570,13 @@ class DriftAI:
         self.difficulty = difficulty
         self.mark = Mark.O
         self.opp = Mark.X
+        self.progress = ""
+        self.progress_frac = 0.0
 
     # --- Evaluation ---
     def evaluate(self, board):
         """Score the board from AI's perspective. Higher = better for AI."""
-        w, _ = board.check_winner()
-        if w == self.mark:
-            return 100000
-        if w == self.opp:
-            return -100000
-
-        score = 0
-        for line in _WIN_LINES:
-            own = opp = 0
-            for r, c in line:
-                m = board.grid[r][c].mark
-                if m == self.mark:
-                    own += 1
-                elif m == self.opp:
-                    opp += 1
-            if opp == 0 and own > 0:
-                score += [0, 5, 50, 500][own]
-            if own == 0 and opp > 0:
-                score -= [0, 5, 50, 500][opp]
-
-        for r in range(GRID_ROWS):
-            for c in range(GRID_COLS):
-                cell = board.grid[r][c]
-                if cell.mark == Mark.EMPTY:
-                    continue
-                mult = 1 if cell.mark == self.mark else -1
-                zone = board.zones.get((r, c), Zone.NONE)
-                if zone == Zone.RIFT:
-                    score += 40 * mult
-                elif zone == Zone.ACCELERATOR:
-                    score -= 12 * mult
-                max_a = SENTINEL_DECAY if cell.piece_type == PieceType.SENTINEL else MAX_AGE
-                life = max(0, max_a - cell.age)
-                score += life * 2 * mult
-                if cell.anchored:
-                    score += 18 * mult
-                # Center bonus
-                if (r, c) in ((1, 1), (1, 2), (2, 1), (2, 2)):
-                    score += 6 * mult
-        return score
+        return _eval_board(board, self.mark, self.opp)
 
     # --- Draft ---
     def choose_draft(self):
@@ -433,6 +586,124 @@ class DriftAI:
             chosen = random.sample(types, 2)
             return {p: 1 for p in chosen}
         return dict(random.choice(picks))
+
+    # --- Tactical overrides (all difficulties) ---
+    def _find_win_threats(self, board, mark):
+        """Find cells where placing `mark` would complete 4-in-a-row."""
+        threats = set()
+        for line in _WIN_LINES:
+            own = 0
+            empty_cell = None
+            n_empty = 0
+            blocked = False
+            for r, c in line:
+                m = board.grid[r][c].mark
+                if m == mark:
+                    own += 1
+                elif m == Mark.EMPTY:
+                    n_empty += 1
+                    empty_cell = (r, c)
+                else:
+                    blocked = True
+                    break
+            if not blocked and own == 3 and n_empty == 1 and empty_cell:
+                threats.add(empty_cell)
+        return list(threats)
+
+    def _tactical_placement(self, game, empties):
+        """Mandatory tactical checks before evaluation. Returns move or None."""
+        empties_set = set(empties)
+        # 1. Can we win by placing?
+        for r, c in empties:
+            bc = game.board.copy()
+            bc.place(r, c, self.mark, PieceType.NORMAL)
+            w, _ = bc.check_winner()
+            if w == self.mark:
+                return (r, c, PieceType.NORMAL)
+        # 2. Can we win by place + push?
+        for r, c in empties:
+            bc = game.board.copy()
+            bc.place(r, c, self.mark, PieceType.NORMAL)
+            for axis, idx, d in _PUSH_SPECS:
+                ab = _sim_push(bc, axis, idx, d)
+                w, _ = ab.check_winner()
+                if w == self.mark:
+                    return (r, c, PieceType.NORMAL)
+        # 3. Must block: opponent can win by placing next turn
+        threats = self._find_win_threats(game.board, self.opp)
+        if threats:
+            for cell in threats:
+                if cell in empties_set:
+                    return (*cell, PieceType.NORMAL)
+        # 4. Must block: opponent can win via push right now
+        #    (they'll push on THEIR action phase, but if it's currently their
+        #     turn coming up, we need to disrupt)
+        #    Actually this is checked in action tactical.
+        # 5. Prevent FUTURE threats: fork prevention (Medium/Hard)
+        if self.difficulty in ("medium", "hard"):
+            fork_cells = {}
+            for line in _WIN_LINES:
+                own = 0
+                empty_cells = []
+                blocked = False
+                for r, c in line:
+                    m = board_mark = game.board.grid[r][c].mark
+                    if m == self.opp:
+                        own += 1
+                    elif m == Mark.EMPTY:
+                        empty_cells.append((r, c))
+                    else:
+                        blocked = True
+                        break
+                if not blocked and own == 2 and len(empty_cells) == 2:
+                    for ec in empty_cells:
+                        if ec in empties_set:
+                            fork_cells[ec] = fork_cells.get(ec, 0) + 1
+            # A cell that appears in 2+ opponent 2-in-a-rows is a fork threat
+            for cell, count in sorted(fork_cells.items(), key=lambda x: -x[1]):
+                if count >= 2:
+                    return (*cell, PieceType.NORMAL)
+        return None
+
+    def _tactical_action(self, game):
+        """Mandatory tactical checks for action phase. Returns move or None."""
+        # 1. Can we win with a push?
+        for arrow in game.arrows:
+            ab = self._simulate_action(game.board, arrow)
+            w, _ = ab.check_winner()
+            if w == self.mark:
+                return ('push', arrow)
+        # 2. Must break opponent's winning threat (3-in-a-row with open cell)
+        threats = self._find_win_threats(game.board, self.opp)
+        if threats:
+            best_arrow = None
+            best_remaining = len(threats)
+            best_score = -999999
+            for arrow in game.arrows:
+                ab = self._simulate_action(game.board, arrow)
+                remaining = len(self._find_win_threats(ab, self.opp))
+                if remaining < best_remaining or (remaining == best_remaining
+                                                   and self.evaluate(ab) > best_score):
+                    best_remaining = remaining
+                    best_arrow = arrow
+                    best_score = self.evaluate(ab)
+            if best_arrow and best_remaining < len(threats):
+                return ('push', best_arrow)
+        # 3. Prevent opponent surge-win combo (place+push+surge-push=win)
+        if self.difficulty in ("medium", "hard"):
+            if _can_surge_win(game.board, self.opp):
+                best_arrow = None
+                best_score = -999999
+                for arrow in game.arrows:
+                    ab = self._simulate_action(game.board, arrow)
+                    if not _can_surge_win(ab, self.opp):
+                        s = self.evaluate(ab)
+                        if s > best_score:
+                            best_score = s
+                            best_arrow = arrow
+                if best_arrow:
+                    return ('push', best_arrow)
+        return None
 
     # --- Placement ---
     def choose_placement(self, game):
@@ -447,8 +718,13 @@ class DriftAI:
             if cnt > 0:
                 avail_types.append(pt)
 
-        if self.difficulty == "easy":
-            return (*random.choice(empties), random.choice(avail_types))
+        # Tactical override (all difficulties)
+        tactical = self._tactical_placement(game, empties)
+        if tactical:
+            return tactical
+
+        if self.difficulty == "hard":
+            return self._minimax_placement(game, empties, avail_types)
 
         best = (-999999, None)
         for r, c in empties:
@@ -458,8 +734,7 @@ class DriftAI:
                 if pt == PieceType.LEECH:
                     bc.apply_leech(r, c)
                 s = self.evaluate(bc)
-                # Hard: also consider best follow-up action
-                if self.difficulty == "hard":
+                if self.difficulty == "medium":
                     s = self._best_action_score(bc, game)
                 if s > best[0]:
                     best = (s, (r, c, pt))
@@ -484,24 +759,29 @@ class DriftAI:
     # --- Action ---
     def choose_action(self, game):
         """Returns ('push', arrow) or ('anchor', r, c) or ('skip',)."""
-        if self.difficulty == "easy":
-            actions = [('skip',)]
-            for arrow in game.arrows:
-                actions.append(('push', arrow))
-            return random.choice(actions)
+        # Tactical override (all difficulties)
+        tactical = self._tactical_action(game)
+        if tactical:
+            return tactical
+
+        if self.difficulty == "hard":
+            return self._minimax_action(game)
 
         best = (self.evaluate(game.board), ('skip',))
         for arrow in game.arrows:
             bc = game.board.copy()
             d = 1 if arrow.direction in (Direction.DOWN, Direction.RIGHT) else -1
             ml = bc.push(arrow.axis, arrow.index, d)
-            if self.difficulty == "hard":
+            if self.difficulty == "medium":
                 bc.apply_catalyst_effects(ml)
                 bc.apply_warp_effects(ml)
             s = self.evaluate(bc)
-            # Surge bonus
+            # Surge bonus for us
             if game.phase == Phase.ACTION and bc.has_three_in_a_row(self.mark):
                 s += 150
+            # Penalty if this leaves opponent with surge-win combo
+            if _can_surge_win(bc, self.opp):
+                s -= 50000
             if s > best[0]:
                 best = (s, ('push', arrow))
 
@@ -518,6 +798,158 @@ class DriftAI:
                             s = self.evaluate(bc)
                             if s > best[0]:
                                 best = (s, ('anchor', r, c))
+        return best[1]
+
+    # --- Minimax (Impossible) ---
+    def _simulate_action(self, board, arrow):
+        bc = board.copy()
+        d = 1 if arrow.direction in (Direction.DOWN, Direction.RIGHT) else -1
+        ml = bc.push(arrow.axis, arrow.index, d)
+        bc.apply_catalyst_effects(ml)
+        bc.apply_warp_effects(ml)
+        return bc
+
+    def _opp_piece_types(self, game):
+        types = [PieceType.NORMAL]
+        for pt, cnt in game.power_pieces.get(self.opp, {}).items():
+            if cnt > 0:
+                types.append(pt)
+        return types
+
+    def _minimax_placement(self, game, empties, avail_types):
+        """Impossible: parallel deep evaluation of placements."""
+        best = (-999999, None)
+        opp_type_vals = [t.value for t in self._opp_piece_types(game)]
+        opp_anchors = game.anchors.get(self.opp, 0)
+
+        # Pre-score candidates
+        candidates = []
+        tie = 0
+        for r, c in empties:
+            for pt in avail_types:
+                bc = game.board.copy()
+                bc.place(r, c, self.mark, pt)
+                if pt == PieceType.LEECH:
+                    bc.apply_leech(r, c)
+                quick_score = self._best_action_score(bc, game)
+                candidates.append((quick_score, tie, r, c, pt))
+                tie += 1
+        candidates.sort(reverse=True)
+        top = candidates[:16]
+
+        # Prepare boards after our best action
+        jobs = []
+        for _, _, r, c, pt in top:
+            bc = game.board.copy()
+            bc.place(r, c, self.mark, pt)
+            if pt == PieceType.LEECH:
+                bc.apply_leech(r, c)
+            best_board = bc
+            best_s = self.evaluate(bc)
+            for arrow in game.arrows:
+                ab = self._simulate_action(bc, arrow)
+                s = self.evaluate(ab)
+                if ab.has_three_in_a_row(self.mark):
+                    s += 200
+                if s > best_s:
+                    best_s = s
+                    best_board = ab
+            jobs.append((best_board, r, c, pt))
+
+        # Parallel deep evaluation
+        n_workers = min(os.cpu_count() or 4, 8)
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                futures = {}
+                for board, r, c, pt in jobs:
+                    f = executor.submit(_worker_deep_eval, board,
+                                        self.mark, self.opp, opp_type_vals, opp_anchors)
+                    futures[f] = (r, c, pt)
+                done = 0
+                for f in as_completed(futures):
+                    done += 1
+                    self.progress_frac = done / len(futures)
+                    self.progress = f"{done}/{len(futures)}"
+                    score = f.result()
+                    rr, cc, pp = futures[f]
+                    if score > best[0]:
+                        best = (score, (rr, cc, pp))
+        except Exception:
+            # Fallback to sequential
+            for board, r, c, pt in jobs:
+                score = _worker_deep_eval(board, self.mark, self.opp, opp_type_vals, opp_anchors)
+                if score > best[0]:
+                    best = (score, (r, c, pt))
+        return best[1]
+
+    def _minimax_action(self, game):
+        """Impossible: parallel deep evaluation of actions."""
+        opp_type_vals = [t.value for t in self._opp_piece_types(game)]
+        opp_anchors = game.anchors.get(self.opp, 0)
+
+        # Prepare all action boards
+        action_jobs = []
+        # Skip
+        action_jobs.append((game.board, ('skip',), False))
+        # Pushes
+        for arrow in game.arrows:
+            ab = self._simulate_action(game.board, arrow)
+            w, _ = ab.check_winner()
+            if w == self.mark:
+                return ('push', arrow)
+            surge = game.phase == Phase.ACTION and ab.has_three_in_a_row(self.mark)
+            if surge:
+                best_surge = ab
+                bonus_best = self.evaluate(ab)
+                for a2 in game.arrows:
+                    ab2 = self._simulate_action(ab, a2)
+                    s = self.evaluate(ab2)
+                    if s > bonus_best:
+                        bonus_best = s
+                        best_surge = ab2
+                action_jobs.append((best_surge, ('push', arrow), True))
+            else:
+                action_jobs.append((ab, ('push', arrow), False))
+        # Anchors
+        if game.anchors[self.mark] > 0:
+            for r in range(GRID_ROWS):
+                for c in range(GRID_COLS):
+                    cell = game.board.grid[r][c]
+                    if cell.mark == self.mark and not cell.anchored:
+                        zone = game.board.zones.get((r, c), Zone.NONE)
+                        if zone != Zone.RIFT:
+                            bc = game.board.copy()
+                            bc.grid[r][c].anchored = True
+                            action_jobs.append((bc, ('anchor', r, c), False))
+
+        # Parallel deep evaluation
+        best = (-999999, ('skip',))
+        n_workers = min(os.cpu_count() or 4, 8)
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                futures = {}
+                for board, action, is_surge in action_jobs:
+                    f = executor.submit(_worker_deep_eval, board,
+                                        self.mark, self.opp, opp_type_vals, opp_anchors)
+                    futures[f] = (action, is_surge)
+                done = 0
+                for f in as_completed(futures):
+                    done += 1
+                    self.progress_frac = done / len(futures)
+                    self.progress = f"{done}/{len(futures)}"
+                    score = f.result()
+                    action, is_surge = futures[f]
+                    if is_surge:
+                        score += 100
+                    if score > best[0]:
+                        best = (score, action)
+        except Exception:
+            for board, action, is_surge in action_jobs:
+                score = _worker_deep_eval(board, self.mark, self.opp, opp_type_vals, opp_anchors)
+                if is_surge:
+                    score += 100
+                if score > best[0]:
+                    best = (score, action)
         return best[1]
 
 
@@ -598,11 +1030,12 @@ class DriftGame:
         # Mode select buttons
         ms_x = WIN_W // 2 - 120
         ms_y0 = 200
+        gap = 60
         self.mode_btns = [
             (pygame.Rect(ms_x, ms_y0, 240, 44), "VS HUMAN", None),
-            (pygame.Rect(ms_x, ms_y0 + 60, 240, 44), "VS AI: EASY", "easy"),
-            (pygame.Rect(ms_x, ms_y0 + 120, 240, 44), "VS AI: MEDIUM", "medium"),
-            (pygame.Rect(ms_x, ms_y0 + 180, 240, 44), "VS AI: HARD", "hard"),
+            (pygame.Rect(ms_x, ms_y0 + gap, 240, 44), "VS AI: EASY", "easy"),
+            (pygame.Rect(ms_x, ms_y0 + gap * 2, 240, 44), "VS AI: MEDIUM", "medium"),
+            (pygame.Rect(ms_x, ms_y0 + gap * 3, 240, 44), "VS AI: HARD", "hard"),
         ]
 
         # Draft card rects (built in draw)
@@ -621,24 +1054,25 @@ class DriftGame:
 
     def _build_arrows(self):
         arrows = []
-        sz = 14
+        sz = 12
+        offset = 26
         for c in range(GRID_COLS):
             cx = BOARD_X0 + c * CELL_SIZE + CELL_SIZE // 2
-            cy = BOARD_Y0 - 22
+            cy = BOARD_Y0 - offset
             arrows.append(Arrow(cx, cy, Direction.DOWN, "col", c,
                                 [(cx, cy + sz), (cx - sz, cy - sz // 2), (cx + sz, cy - sz // 2)]))
         for c in range(GRID_COLS):
             cx = BOARD_X0 + c * CELL_SIZE + CELL_SIZE // 2
-            cy = BOARD_Y0 + BOARD_H + 22
+            cy = BOARD_Y0 + BOARD_H + offset
             arrows.append(Arrow(cx, cy, Direction.UP, "col", c,
                                 [(cx, cy - sz), (cx - sz, cy + sz // 2), (cx + sz, cy + sz // 2)]))
         for r in range(GRID_ROWS):
-            cx = BOARD_X0 - 22
+            cx = BOARD_X0 - offset
             cy = BOARD_Y0 + r * CELL_SIZE + CELL_SIZE // 2
             arrows.append(Arrow(cx, cy, Direction.RIGHT, "row", r,
                                 [(cx + sz, cy), (cx - sz // 2, cy - sz), (cx - sz // 2, cy + sz)]))
         for r in range(GRID_ROWS):
-            cx = BOARD_X0 + BOARD_W + 22
+            cx = BOARD_X0 + BOARD_W + offset
             cy = BOARD_Y0 + r * CELL_SIZE + CELL_SIZE // 2
             arrows.append(Arrow(cx, cy, Direction.LEFT, "row", r,
                                 [(cx - sz, cy), (cx + sz // 2, cy - sz), (cx + sz // 2, cy + sz)]))
@@ -683,6 +1117,10 @@ class DriftGame:
         self.ai_difficulty = None
         self.ai = None
         self.ai_think_start = 0
+        self.ai_thread = None
+        self.ai_result = None
+        self.ai_computing = False
+        self.ai_compute_start = 0
 
     def _reset_draft_counts(self):
         self.draft_counts = {pt: 0 for pt, _, _, _ in POWER_PIECE_INFO}
@@ -885,33 +1323,38 @@ class DriftGame:
     # --- Mode Select ---
     def _draw_mode_select(self):
         title = self.f_lg.render("SELECT MODE", True, (0, 212, 255))
-        self.screen.blit(title, (WIN_W // 2 - title.get_width() // 2, 100))
+        self.screen.blit(title, (WIN_W // 2 - title.get_width() // 2, 80))
         sub = self.f_sm.render("Player X is always human. Choose opponent.", True, (100, 140, 170))
-        self.screen.blit(sub, (WIN_W // 2 - sub.get_width() // 2, 150))
+        self.screen.blit(sub, (WIN_W // 2 - sub.get_width() // 2, 125))
 
         mouse = pygame.mouse.get_pos()
+        diff_colors = {
+            None: (0, 212, 255),
+            "easy": (100, 200, 100),
+            "medium": (200, 180, 60),
+            "hard": (220, 80, 80),
+        }
         for rect, label, diff in self.mode_btns:
             h = rect.collidepoint(mouse)
             bg = BUTTON_HOVER if h else BUTTON_COLOR
             pygame.draw.rect(self.screen, bg, rect, border_radius=8)
-            bc = (0, 212, 255) if diff is None else (
-                (100, 200, 100) if diff == "easy" else
-                (200, 180, 60) if diff == "medium" else (220, 80, 80))
-            pygame.draw.rect(self.screen, bc, rect, 2, border_radius=8)
+            pygame.draw.rect(self.screen, diff_colors.get(diff, GRID_COLOR), rect, 2, border_radius=8)
             t = self.f_md.render(label, True, BUTTON_TEXT)
             self.screen.blit(t, (rect.centerx - t.get_width() // 2,
                                  rect.centery - t.get_height() // 2))
 
-        # Difficulty descriptions
         descs = [
-            ("Two humans on the same screen.", 460),
-            ("AI makes random moves.", 520),
-            ("AI evaluates board position.", 580),
-            ("AI plans placement + action combos.", 640),
+            "Two humans, same screen.",
+            "Heuristic evaluation. Fair challenge.",
+            "Plans placement + action combos.",
+            "Minimax: 2 turns ahead. Good luck.",
         ]
-        for text, yy in descs:
+        base_y = 170 + 52 * 5 + 12
+        for i, text in enumerate(descs):
             t = self.f_sm.render(text, True, (80, 100, 130))
-            self.screen.blit(t, (WIN_W // 2 - t.get_width() // 2, yy))
+            # Position each desc next to its button
+            btn_rect = self.mode_btns[i][0]
+            self.screen.blit(t, (btn_rect.right + 12, btn_rect.centery - t.get_height() // 2))
 
     # --- Draft ---
     def _draw_draft(self):
@@ -996,10 +1439,23 @@ class DriftGame:
             self.screen.blit(pt, (BOARD_X0 + BOARD_W - pt.get_width(), 42))
             # AI thinking indicator
             if self._is_ai_turn():
-                pulse = abs(math.sin(pygame.time.get_ticks() / 400))
-                ai_c = tuple(int(v * (0.5 + 0.5 * pulse)) for v in (100, 180, 255))
-                at = self.f_sm.render(f"AI thinking ({self.ai_difficulty})...", True, ai_c)
-                self.screen.blit(at, (BOARD_X0 + BOARD_W - at.get_width(), 62))
+                if self.ai_computing and self.ai:
+                    frac = self.ai.progress_frac
+                    # Progress bar only, no text
+                    bar_x = BOARD_X0
+                    bar_y = 68
+                    bar_w = BOARD_W
+                    bar_h = 4
+                    pygame.draw.rect(self.screen, (30, 50, 70), (bar_x, bar_y, bar_w, bar_h))
+                    fill_w = max(1, int(bar_w * frac))
+                    pulse = 0.7 + 0.3 * abs(math.sin(pygame.time.get_ticks() / 300))
+                    bar_c = tuple(int(v * pulse) for v in (0, 200, 255))
+                    pygame.draw.rect(self.screen, bar_c, (bar_x, bar_y, fill_w, bar_h))
+                else:
+                    pulse = abs(math.sin(pygame.time.get_ticks() / 400))
+                    ai_c = tuple(int(v * (0.5 + 0.5 * pulse)) for v in (100, 180, 255))
+                    at = self.f_sm.render(f"AI thinking...", True, ai_c)
+                    self.screen.blit(at, (BOARD_X0 + BOARD_W - at.get_width(), 62))
 
     # --- Sidebar ---
     def _draw_sidebar(self):
@@ -1100,7 +1556,7 @@ class DriftGame:
                 tc = ZONE_TEXT_COLORS.get(key, TEXT_COLOR)
                 label = {"rift": "RIFT", "accel": "ACCEL", "warp": "WARP"}.get(key, "")
                 zt = self.f_zone.render(label, True, tc)
-                self.screen.blit(zt, (x + CELL_SIZE // 2 - zt.get_width() // 2, y + CELL_SIZE - 18))
+                self.screen.blit(zt, (x + CELL_SIZE // 2 - zt.get_width() // 2, y + 4))
 
         # Draw warp connection line
         warp_cells = [pos for pos, z in self.board.zones.items() if z == Zone.WARP]
@@ -1189,10 +1645,10 @@ class DriftGame:
         cy = int(y + CELL_SIZE // 2)
         max_a = SENTINEL_DECAY if cell.piece_type == PieceType.SENTINEL else MAX_AGE
         fade = max(0.2, 1.0 - (cell.age / (max_a + 1)) * 0.8)
-        sz = int(CELL_SIZE * 0.32)
+        sz = int(CELL_SIZE * 0.28)  # slightly smaller to avoid edge overlaps
         is_phantom = cell.piece_type == PieceType.PHANTOM and cell.phantom_turns > 0
         if is_phantom:
-            fade *= 0.5  # ghostly
+            fade *= 0.5
 
         base = X_COLOR if cell.mark == Mark.X else O_COLOR
         color = tuple(int(c * fade) for c in base)
@@ -1200,7 +1656,6 @@ class DriftGame:
 
         if cell.mark == Mark.X:
             if is_phantom:
-                # Dashed X
                 for frac in [0.0, 0.3, 0.6]:
                     s = frac
                     e = min(frac + 0.2, 1.0)
@@ -1215,7 +1670,6 @@ class DriftGame:
                 pygame.draw.line(self.screen, color, (cx + sz, cy - sz), (cx - sz, cy + sz), lw)
         elif cell.mark == Mark.O:
             if is_phantom:
-                # Dashed circle
                 for angle in range(0, 360, 40):
                     a1 = math.radians(angle)
                     a2 = math.radians(angle + 20)
@@ -1225,40 +1679,37 @@ class DriftGame:
             else:
                 pygame.draw.circle(self.screen, color, (cx, cy), sz, lw)
 
-        # Power piece type indicator
+        # Power piece type indicator (bottom-right corner, clear of mark)
         if cell.piece_type != PieceType.NORMAL:
             pt_col = POWER_COLORS.get(cell.piece_type.value, TEXT_COLOR)
             pt_col = tuple(int(c * fade) for c in pt_col)
             label = {"phantom": "Ph", "catalyst": "Ca", "leech": "Le", "sentinel": "Se"
                      }.get(cell.piece_type.value, "")
-            if cell.piece_type == PieceType.CATALYST:
-                # Small radiating dots
-                for angle in [0, 90, 180, 270]:
-                    a = math.radians(angle)
-                    dx = int(math.cos(a) * (sz + 8))
-                    dy = int(math.sin(a) * (sz + 8))
-                    pygame.draw.circle(self.screen, pt_col, (cx + dx, cy + dy), 2)
             if label:
                 lt = self.f_zone.render(label, True, pt_col)
-                self.screen.blit(lt, (int(x + CELL_SIZE - 22), int(y + 4)))
+                self.screen.blit(lt, (int(x + CELL_SIZE - lt.get_width() - 6),
+                                      int(y + CELL_SIZE - lt.get_height() - 18)))
 
         # Anchor indicator
         if cell.anchored:
             pygame.draw.rect(self.screen, ANCHOR_COLOR,
-                             (int(x + 4), int(y + 4), CELL_SIZE - 8, CELL_SIZE - 8), 2)
-            ax, ay = int(x + 16), int(y + 16)
-            d = 5
+                             (int(x + 6), int(y + 6), CELL_SIZE - 12, CELL_SIZE - 12), 2)
+            ax, ay = int(x + 14), int(y + 14)
+            d = 4
             pygame.draw.polygon(self.screen, ANCHOR_COLOR,
                                 [(ax, ay - d), (ax + d, ay), (ax, ay + d), (ax - d, ay)])
 
-        # Age dots
+        # Age dots (moved inward, smaller spacing)
         if cell.mark != Mark.EMPTY:
+            dot_spacing = 6
+            total_w = max_a * dot_spacing
+            start_x = cx - total_w // 2 + dot_spacing // 2
+            dot_y = int(y + CELL_SIZE - 16)
             for i in range(max_a):
-                dx = cx - (max_a * 4) // 2 + i * 8 + 4
-                dy = int(y + CELL_SIZE - 12)
+                dx = start_x + i * dot_spacing
                 filled = i < cell.age
-                dc = ((80, 50, 50) if cell.mark == Mark.X else (30, 70, 50)) if filled else (40, 50, 60)
-                pygame.draw.circle(self.screen, dc, (dx, dy), 2)
+                dc = ((80, 50, 50) if cell.mark == Mark.X else (30, 70, 50)) if filled else (35, 45, 55)
+                pygame.draw.circle(self.screen, dc, (dx, dot_y), 2)
 
     def _draw_win_line(self):
         r0, c0 = self.win_line[0]
@@ -1451,23 +1902,79 @@ class DriftGame:
     # AI
     # ------------------------------------------------------------------
     def _update_ai(self):
-        """Called every frame. Handles AI moves with a thinking delay."""
+        """Called every frame. Handles AI moves with threading for heavy compute."""
         if not self._is_ai_turn():
             self.ai_think_start = 0
             return
         if self.animating:
             self.ai_think_start = 0
             return
+
+        # If background compute is running, check if done
+        if self.ai_computing:
+            if self.ai_thread and not self.ai_thread.is_alive():
+                self.ai_computing = False
+                self.ai_thread = None
+                self._apply_ai_result()
+            return
+
+        # Initial thinking delay (brief pause before computing)
         if self.ai_think_start == 0:
             self.ai_think_start = pygame.time.get_ticks()
             return
-        delay = {"easy": 400, "medium": 700, "hard": 1000}.get(self.ai_difficulty, 700)
+        delay = {"easy": 400, "medium": 500, "hard": 300}.get(self.ai_difficulty, 400)
         if pygame.time.get_ticks() - self.ai_think_start < delay:
             return
         self.ai_think_start = 0
-        self._ai_make_move()
+
+        # Easy/Medium compute inline, Hard uses background thread
+        if self.ai_difficulty in ("easy", "medium"):
+            self._ai_make_move()
+        else:
+            # Impossible: run in background thread
+            self.ai_computing = True
+            self.ai_compute_start = pygame.time.get_ticks()
+            self.ai_result = None
+            if self.ai:
+                self.ai.progress = "Starting..."
+                self.ai.progress_frac = 0.0
+            phase = self.phase
+            self.ai_thread = threading.Thread(
+                target=self._ai_compute_threaded, args=(phase,), daemon=True)
+            self.ai_thread.start()
+
+    def _ai_compute_threaded(self, phase):
+        """Runs in background thread for Impossible AI."""
+        try:
+            if phase == Phase.PLACE:
+                self.ai_result = ('place', self.ai.choose_placement(self))
+            elif phase in (Phase.ACTION, Phase.SURGE):
+                self.ai_result = ('action', self.ai.choose_action(self))
+        except Exception as e:
+            print(f"AI error: {e}")
+            self.ai_result = ('action', ('skip',))
+
+    def _apply_ai_result(self):
+        """Apply the result from a background AI computation."""
+        if not self.ai_result:
+            return
+        kind, data = self.ai_result
+        self.ai_result = None
+        if kind == 'place' and data:
+            r, c, pt = data
+            if pt != PieceType.NORMAL:
+                self.selected_pp = pt
+            self.do_place(r, c)
+        elif kind == 'action':
+            if data[0] == 'push':
+                self.do_push(data[1])
+            elif data[0] == 'anchor':
+                self.do_anchor(data[1], data[2])
+            else:
+                self.do_skip()
 
     def _ai_make_move(self):
+        """Inline AI move for fast difficulties."""
         if self.phase == Phase.PLACE:
             result = self.ai.choose_placement(self)
             if result:
@@ -1510,4 +2017,6 @@ class DriftGame:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     DriftGame().run()

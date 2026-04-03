@@ -455,7 +455,7 @@ def build_pdf():
     pdf.add_page()
     pdf.section_title("AI Opponent")
     pdf.body(
-        "DRIFT supports single-player mode with an AI opponent at three difficulty "
+        "DRIFT supports single-player mode with an AI opponent at four difficulty "
         "levels.")
     pdf.ln(4)
 
@@ -474,6 +474,12 @@ def build_pdf():
         ("VS AI: HARD",
          "AI plans placement + action combos, considers catalyst/warp effects, "
          "and values surge opportunities. A tough opponent."),
+        ("VS AI: IMPOSSIBLE",
+         "Uses minimax search with opponent response modeling. The AI evaluates "
+         "its top placement candidates, simulates its best follow-up action, then "
+         "models your best counter-move (placement + action). It also simulates "
+         "surge chains during action evaluation. Computationally expensive - the "
+         "AI genuinely thinks several moves ahead. Practically unbeatable."),
     ]
     for name, desc in ai_modes:
         pdf.page_break_if_needed(20)
@@ -486,7 +492,7 @@ def build_pdf():
     ai_how = [
         "You always play as Player X (red). The AI plays as Player O (green).",
         "During the draft phase, you pick your 2 power pieces. The AI auto-drafts "
-        "based on its difficulty (random for Easy, strategic loadouts for Medium/Hard).",
+        "based on its difficulty (random for Easy, strategic loadouts for Medium/Hard/Impossible).",
         "On the AI's turn, you'll see an \"AI thinking...\" indicator. The AI makes "
         "its move after a brief delay.",
         "All normal rules apply to the AI - it can push, anchor, skip, use power "
@@ -511,6 +517,10 @@ def build_pdf():
         ("Hard",
          "The AI considers every placement + action combination. Exploit its lack of "
          "long-term planning - it only looks 1 move ahead. Set up multi-turn sequences."),
+        ("Impossible",
+         "The AI models your best response to every move. Your only edge is long-term "
+         "multi-turn setups it can't see (it only looks 1 full turn ahead). Create board "
+         "states where several different pushes all benefit you - the AI can only block one."),
     ]
     for name, desc in ai_tips:
         pdf.page_break_if_needed(20)
