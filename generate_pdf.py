@@ -450,7 +450,74 @@ def build_pdf():
         pdf.ln(4)
 
     # ================================================================
-    # PAGE 7 - Strategy Guide
+    # AI Opponent
+    # ================================================================
+    pdf.add_page()
+    pdf.section_title("AI Opponent")
+    pdf.body(
+        "DRIFT supports single-player mode with an AI opponent at three difficulty "
+        "levels.")
+    pdf.ln(4)
+
+    # Mode Selection
+    pdf.sub_heading("Mode Selection")
+    pdf.body_sm(
+        "After clicking \"Start Game,\" choose your mode:", indent=0)
+    pdf.ln(2)
+    ai_modes = [
+        ("VS HUMAN",
+         "Two players on the same screen (classic mode)."),
+        ("VS AI: EASY",
+         "AI makes random moves. Great for learning the game."),
+        ("VS AI: MEDIUM",
+         "AI evaluates board positions using heuristics. A fair challenge."),
+        ("VS AI: HARD",
+         "AI plans placement + action combos, considers catalyst/warp effects, "
+         "and values surge opportunities. A tough opponent."),
+    ]
+    for name, desc in ai_modes:
+        pdf.page_break_if_needed(20)
+        pdf.named_block(name, desc)
+    pdf.ln(2)
+
+    # How It Works
+    pdf.sub_heading("How It Works")
+    pdf.ln(2)
+    ai_how = [
+        "You always play as Player X (red). The AI plays as Player O (green).",
+        "During the draft phase, you pick your 2 power pieces. The AI auto-drafts "
+        "based on its difficulty (random for Easy, strategic loadouts for Medium/Hard).",
+        "On the AI's turn, you'll see an \"AI thinking...\" indicator. The AI makes "
+        "its move after a brief delay.",
+        "All normal rules apply to the AI - it can push, anchor, skip, use power "
+        "pieces, and earn surges.",
+    ]
+    for item in ai_how:
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_text_color(*C_BODY)
+        pdf.cell(0, 7, f"  - {item}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Tips for Beating the AI
+    pdf.page_break_if_needed(60)
+    pdf.sub_heading("Tips for Beating the AI")
+    pdf.ln(2)
+    ai_tips = [
+        ("Easy",
+         "Just play normally. The AI won't block your lines or make strategic pushes."),
+        ("Medium",
+         "The AI will block obvious 3-in-a-rows and compete for zones. Watch for "
+         "its Leech placements."),
+        ("Hard",
+         "The AI considers every placement + action combination. Exploit its lack of "
+         "long-term planning - it only looks 1 move ahead. Set up multi-turn sequences."),
+    ]
+    for name, desc in ai_tips:
+        pdf.page_break_if_needed(20)
+        pdf.named_block(name, desc, name_col=C_TIP_LABEL)
+
+    # ================================================================
+    # PAGE - Strategy Guide
     # ================================================================
     pdf.add_page()
     pdf.section_title("Strategy Guide")
