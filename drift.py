@@ -11,6 +11,7 @@ import sys
 import math
 import random
 import threading
+import numpy as np
 from enum import Enum
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -546,6 +547,187 @@ def _worker_deep_eval(board, ai_mark, ai_opp, opp_type_vals, opp_anchors):
     return worst
 
 
+# ---------------------------------------------------------------------------
+# ML AI (numpy-only inference, no PyTorch needed)
+# ---------------------------------------------------------------------------
+_MARK_IDX = {Mark.EMPTY: 0, Mark.X: 1, Mark.O: 2}
+_PTYPE_IDX = {PieceType.NORMAL: 0, PieceType.PHANTOM: 1, PieceType.CATALYST: 2,
+              PieceType.LEECH: 3, PieceType.SENTINEL: 4}
+_ZONE_IDX = {Zone.NONE: 0, Zone.RIFT: 1, Zone.ACCELERATOR: 2, Zone.WARP: 3}
+_PTYPES_LIST = [PieceType.NORMAL, PieceType.PHANTOM, PieceType.CATALYST,
+                PieceType.LEECH, PieceType.SENTINEL]
+_N_MARK, _N_PTYPE, _N_ZONE = 3, 5, 4
+_CELL_FEAT = _N_MARK + 1 + 1 + _N_PTYPE + _N_ZONE + 1  # 15
+_GLOBAL_FEAT = 13
+_STATE_DIM = GRID_ROWS * GRID_COLS * _CELL_FEAT + _GLOBAL_FEAT  # 253
+_N_PLACE = GRID_ROWS * GRID_COLS * 5  # 80
+_N_ACTION_TOTAL = _N_PLACE + len(_PUSH_SPECS) + 16 + 1  # 113
+
+
+def _encode_state(board, mark, anchors, power_pieces, phase_is_place, turn):
+    """Encode board state as flat numpy array from `mark`'s perspective."""
+    opp = Mark.O if mark == Mark.X else Mark.X
+    feat = np.zeros(_STATE_DIM, dtype=np.float32)
+    idx = 0
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            cell = board.grid[r][c]
+            zone = board.zones.get((r, c), Zone.NONE)
+            if cell.mark == Mark.EMPTY:
+                feat[idx] = 1.0
+            elif cell.mark == mark:
+                feat[idx + 1] = 1.0
+            else:
+                feat[idx + 2] = 1.0
+            idx += _N_MARK
+            max_a = SENTINEL_DECAY if cell.piece_type == PieceType.SENTINEL else MAX_AGE
+            feat[idx] = cell.age / max_a if cell.mark != Mark.EMPTY else 0
+            idx += 1
+            feat[idx] = 1.0 if cell.anchored else 0.0
+            idx += 1
+            if cell.mark != Mark.EMPTY:
+                feat[idx + _PTYPE_IDX[cell.piece_type]] = 1.0
+            idx += _N_PTYPE
+            feat[idx + _ZONE_IDX[zone]] = 1.0
+            idx += _N_ZONE
+            feat[idx] = cell.phantom_turns / PHANTOM_DURATION if cell.phantom_turns > 0 else 0
+            idx += 1
+    feat[idx] = anchors.get(mark, 0) / ANCHORS_PER_PLAYER
+    feat[idx + 1] = anchors.get(opp, 0) / ANCHORS_PER_PLAYER
+    idx += 2
+    for i, pt in enumerate(_PTYPES_LIST[1:]):
+        feat[idx + i] = power_pieces.get(mark, {}).get(pt, 0) / 2.0
+    idx += 4
+    for i, pt in enumerate(_PTYPES_LIST[1:]):
+        feat[idx + i] = power_pieces.get(opp, {}).get(pt, 0) / 2.0
+    idx += 4
+    feat[idx] = 1.0 if phase_is_place else 0.0
+    feat[idx + 1] = 0.0 if phase_is_place else 1.0
+    idx += 2
+    feat[idx] = min(turn / 30.0, 1.0)
+    return feat
+
+
+class MLInference:
+    """Numpy-only neural network inference (no PyTorch)."""
+
+    def __init__(self, model_path):
+        data = np.load(model_path)
+        self.weights = {k: data[k] for k in data.files}
+
+    def _relu(self, x):
+        return np.maximum(0, x)
+
+    def _forward(self, state):
+        # Shared layers
+        h = state @ self.weights["shared_0_weight"].T + self.weights["shared_0_bias"]
+        h = self._relu(h)
+        h = h @ self.weights["shared_2_weight"].T + self.weights["shared_2_bias"]
+        h = self._relu(h)
+        # Policy head
+        p = h @ self.weights["policy_0_weight"].T + self.weights["policy_0_bias"]
+        p = self._relu(p)
+        p = p @ self.weights["policy_2_weight"].T + self.weights["policy_2_bias"]
+        # Value head
+        v = h @ self.weights["value_0_weight"].T + self.weights["value_0_bias"]
+        v = self._relu(v)
+        v = v @ self.weights["value_2_weight"].T + self.weights["value_2_bias"]
+        v = np.tanh(v)
+        return p, v[0]
+
+    def get_action(self, state, valid_indices):
+        """Get best action from valid action indices."""
+        logits, value = self._forward(state)
+        masked = np.full(len(logits), -1e9)
+        for idx in valid_indices:
+            masked[idx] = logits[idx]
+        return int(np.argmax(masked)), value
+
+
+class DriftMLAI:
+    """ML-based AI using trained neural network. Plays as Mark.O."""
+
+    def __init__(self, model_path):
+        self.mark = Mark.O
+        self.opp = Mark.X
+        self.net = MLInference(model_path)
+        self.progress = ""
+        self.progress_frac = 0.0
+
+    def choose_draft(self):
+        picks = [
+            {PieceType.LEECH: 1, PieceType.CATALYST: 1},
+            {PieceType.LEECH: 1, PieceType.PHANTOM: 1},
+            {PieceType.PHANTOM: 1, PieceType.CATALYST: 1},
+        ]
+        return dict(random.choice(picks))
+
+    def evaluate(self, board):
+        return _eval_board(board, self.mark, self.opp)
+
+    def choose_placement(self, game):
+        empties = [(r, c) for r in range(GRID_ROWS) for c in range(GRID_COLS)
+                   if game.board.grid[r][c].mark == Mark.EMPTY]
+        if not empties:
+            return None
+        state = _encode_state(game.board, self.mark, game.anchors,
+                              game.power_pieces, True, game.turn_number)
+        # Build valid placement actions
+        avail = [PieceType.NORMAL]
+        for pt, cnt in game.power_pieces[self.mark].items():
+            if cnt > 0:
+                avail.append(pt)
+        valid = []
+        valid_map = {}
+        for r, c in empties:
+            for pt in avail:
+                idx = (r * GRID_COLS + c) * 5 + _PTYPE_IDX[pt]
+                valid.append(idx)
+                valid_map[idx] = (r, c, pt)
+        best_idx, _ = self.net.get_action(state, valid)
+        if best_idx in valid_map:
+            return valid_map[best_idx]
+        # Fallback
+        return (*random.choice(empties), PieceType.NORMAL)
+
+    def choose_action(self, game):
+        state = _encode_state(game.board, self.mark, game.anchors,
+                              game.power_pieces, False, game.turn_number)
+        base = _N_PLACE
+        valid = []
+        valid_map = {}
+        # Pushes (map to arrows)
+        for i, (axis, idx, d) in enumerate(_PUSH_SPECS):
+            action_idx = base + i
+            valid.append(action_idx)
+            # Find matching arrow
+            for arrow in game.arrows:
+                ad = 1 if arrow.direction in (Direction.DOWN, Direction.RIGHT) else -1
+                if arrow.axis == axis and arrow.index == idx and ad == d:
+                    valid_map[action_idx] = ('push', arrow)
+                    break
+        # Anchors
+        if game.anchors[self.mark] > 0:
+            for r in range(GRID_ROWS):
+                for c in range(GRID_COLS):
+                    cell = game.board.grid[r][c]
+                    if cell.mark == self.mark and not cell.anchored:
+                        zone = game.board.zones.get((r, c), Zone.NONE)
+                        if zone != Zone.RIFT:
+                            action_idx = base + len(_PUSH_SPECS) + r * GRID_COLS + c
+                            valid.append(action_idx)
+                            valid_map[action_idx] = ('anchor', r, c)
+        # Skip
+        skip_idx = base + len(_PUSH_SPECS) + 16
+        valid.append(skip_idx)
+        valid_map[skip_idx] = ('skip',)
+
+        best_idx, _ = self.net.get_action(state, valid)
+        if best_idx in valid_map:
+            return valid_map[best_idx]
+        return ('skip',)
+
+
 class DriftAI:
     """AI opponent for DRIFT. Plays as Mark.O."""
 
@@ -1029,13 +1211,14 @@ class DriftGame:
 
         # Mode select buttons
         ms_x = WIN_W // 2 - 120
-        ms_y0 = 200
-        gap = 60
+        ms_y0 = 180
+        gap = 52
         self.mode_btns = [
             (pygame.Rect(ms_x, ms_y0, 240, 44), "VS HUMAN", None),
             (pygame.Rect(ms_x, ms_y0 + gap, 240, 44), "VS AI: EASY", "easy"),
             (pygame.Rect(ms_x, ms_y0 + gap * 2, 240, 44), "VS AI: MEDIUM", "medium"),
             (pygame.Rect(ms_x, ms_y0 + gap * 3, 240, 44), "VS AI: HARD", "hard"),
+            (pygame.Rect(ms_x, ms_y0 + gap * 4, 240, 44), "VS AI: IMPOSSIBLE", "impossible"),
         ]
 
         # Draft card rects (built in draw)
@@ -1333,6 +1516,7 @@ class DriftGame:
             "easy": (100, 200, 100),
             "medium": (200, 180, 60),
             "hard": (220, 80, 80),
+            "impossible": (200, 50, 220),
         }
         for rect, label, diff in self.mode_btns:
             h = rect.collidepoint(mouse)
@@ -1347,7 +1531,8 @@ class DriftGame:
             "Two humans, same screen.",
             "Heuristic evaluation. Fair challenge.",
             "Plans placement + action combos.",
-            "Minimax: 2 turns ahead. Good luck.",
+            "Minimax: 2 turns ahead.",
+            "Neural network trained via self-play.",
         ]
         base_y = 170 + 52 * 5 + 12
         for i, text in enumerate(descs):
@@ -1818,6 +2003,15 @@ class DriftGame:
                     if diff is None:
                         self.ai_enabled = False
                         self.ai = None
+                    elif diff == "impossible":
+                        self.ai_enabled = True
+                        self.ai_difficulty = diff
+                        model_path = self._res("assets/drift_model.npz")
+                        if os.path.exists(model_path):
+                            self.ai = DriftMLAI(model_path)
+                        else:
+                            self.ai = DriftAI("hard")  # fallback
+                            self.ai_difficulty = "hard"
                     else:
                         self.ai_enabled = True
                         self.ai_difficulty = diff
@@ -1922,13 +2116,13 @@ class DriftGame:
         if self.ai_think_start == 0:
             self.ai_think_start = pygame.time.get_ticks()
             return
-        delay = {"easy": 400, "medium": 500, "hard": 300}.get(self.ai_difficulty, 400)
+        delay = {"easy": 400, "medium": 500, "hard": 300, "impossible": 300}.get(self.ai_difficulty, 400)
         if pygame.time.get_ticks() - self.ai_think_start < delay:
             return
         self.ai_think_start = 0
 
-        # Easy/Medium compute inline, Hard uses background thread
-        if self.ai_difficulty in ("easy", "medium"):
+        # Easy/Medium/Impossible compute inline, Hard uses background thread
+        if self.ai_difficulty in ("easy", "medium", "impossible"):
             self._ai_make_move()
         else:
             # Impossible: run in background thread
